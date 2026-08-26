@@ -1,0 +1,55 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+    function incoming() {
+      return request.resource.data;
+    }
+    function existing() {
+      return resource.data;
+    }
+
+    // Default catch-all deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // User Profiles
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidId(userId) && incoming().uid == request.auth.uid;
+      allow update: if isOwner(userId) && incoming().uid == existing().uid;
+      allow delete: if false;
+    }
+
+    // Business Locations
+    match /locations/{locationId} {
+      allow get: if isSignedIn() && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && isValidId(locationId) && incoming().userId == request.auth.uid;
+      allow update: if isSignedIn() && existing().userId == request.auth.uid && incoming().userId == existing().userId;
+      allow delete: if isSignedIn() && existing().userId == request.auth.uid;
+
+      // Subcollection: Grid Points
+      match /gridPoints/{pointId} {
+        allow get, list: if isSignedIn() && get(/databases/$(database)/documents/locations/$(locationId)).data.userId == request.auth.uid;
+        allow create, update, delete: if isSignedIn() && isValidId(pointId) && get(/databases/$(database)/documents/locations/$(locationId)).data.userId == request.auth.uid;
+      }
+    }
+
+    // Connection test document
+    match /test/connection {
+      allow read: if true;
+    }
+  }
+}

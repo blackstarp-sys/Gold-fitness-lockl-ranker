@@ -1,0 +1,59 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "User preferences and system roles",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Unique user identifier" },
+        "email": { "type": "string", "description": "User email address" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "role": { "type": "string", "enum": ["admin", "manager", "user"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "BusinessLocation": {
+      "title": "Business Location",
+      "description": "Local business profile coordinates and address for Maps tracking",
+      "type": "object",
+      "properties": {
+        "locationId": { "type": "string" },
+        "name": { "type": "string" },
+        "address": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "userId": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["locationId", "name", "userId"]
+    },
+    "RankGridPoint": {
+      "title": "Rank Grid Point",
+      "description": "Local search grid ranking coordinate and score",
+      "type": "object",
+      "properties": {
+        "pointId": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "rank": { "type": "number" },
+        "keyword": { "type": "string" }
+      },
+      "required": ["pointId", "lat", "lng", "rank"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Collection of user profile metadata"
+    },
+    "/locations/{locationId}": {
+      "schema": "BusinessLocation",
+      "description": "Collection of tracked Google Business locations"
+    },
+    "/locations/{locationId}/gridPoints/{pointId}": {
+      "schema": "RankGridPoint",
+      "description": "Subcollection of local search rank evaluation points on Google Maps"
+    }
+  }
+}

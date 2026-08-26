@@ -1,0 +1,8 @@
+{
+  "name": "Goldfitness-localranker",
+  "description": "Google Business Profile Manager with AI Auto-Reply",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
