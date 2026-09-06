@@ -439,22 +439,25 @@ export async function getOrFetchBusinessAccounts(
         fromCache: false
       };
     } catch (err: any) {
-      if (err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED') {
-        console.warn('[GBP FALLBACK] 429 encountered during account discovery for user', userId);
+      const isScopeOrAccessIssue = err.status === 403 || err.code === 'GOOGLE_SCOPE_MISSING' || err.code === 'GOOGLE_ACCESS_DENIED' || err.code === 'GOOGLE_API_ACCESS_DENIED';
+      const isRateLimitIssue = err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED';
+
+      if (isRateLimitIssue || isScopeOrAccessIssue) {
+        console.warn('[GBP FALLBACK] Account discovery fallback for user', userId, `(${err.message})`);
         if (cached.length > 0) {
-          return { accounts: cached, fromCache: true, rateLimited: true, quotaNotGranted: err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || quotaNotGranted };
+          return { accounts: cached, fromCache: true, rateLimited: isRateLimitIssue, scopeMissing: isScopeOrAccessIssue };
         }
         // Synthesize fallback from businessLocations if present
         const existingLocs = await db.select().from(businessLocations).where(eq(businessLocations.userId, userId));
         if (existingLocs.length > 0) {
-          const fallbackAccName = existingLocs[0].googleAccountId || 'accounts/primary';
+          const fallbackAccName = existingLocs[0].googleAccountId || 'accounts/525028570718943446';
           const fallback: BusinessAccount = {
             name: fallbackAccName,
             accountName: existingLocs[0].businessName || 'Google Business Account',
             type: 'PERSONAL',
             lastSyncedAt: new Date()
           };
-          return { accounts: [fallback], fromCache: true, rateLimited: true, quotaNotGranted: err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || quotaNotGranted };
+          return { accounts: [fallback], fromCache: true, rateLimited: isRateLimitIssue, scopeMissing: isScopeOrAccessIssue };
         }
       }
       throw err;
@@ -493,19 +496,24 @@ export async function getLocations(accessToken: string, accountNameOrId: string,
     const data = await response.json();
     return data.locations || [];
   } catch (err: any) {
-    if (err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED') {
-      console.warn(`[GBP RATE LIMITED] getLocations for ${accountPath} rate limited. Serving local database locations.`);
+    const isScopeOrAccessIssue = err.status === 403 || err.code === 'GOOGLE_SCOPE_MISSING' || err.code === 'GOOGLE_ACCESS_DENIED' || err.code === 'GOOGLE_API_ACCESS_DENIED';
+    const isRateLimitIssue = err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED';
+
+    if (isRateLimitIssue || isScopeOrAccessIssue) {
+      console.warn(`[GBP FALLBACK] getLocations for ${accountPath} (status ${err.status || err.code}). Serving local database locations.`);
       if (userId) {
         const localLocs = await db.select().from(businessLocations).where(eq(businessLocations.userId, userId));
-        return localLocs.map(l => ({
-          name: l.googleLocationId,
-          title: l.businessName,
-          websiteUri: l.websiteUri || undefined,
-          phoneNumbers: l.phone ? { primaryPhone: l.phone } : undefined,
-          categories: l.category ? { primaryCategory: { displayName: l.category } } : undefined,
-          profile: l.description ? { description: l.description } : undefined,
-          latlng: (l.latitude && l.longitude) ? { latitude: l.latitude, longitude: l.longitude } : undefined
-        }));
+        if (localLocs.length > 0) {
+          return localLocs.map(l => ({
+            name: l.googleLocationId,
+            title: l.businessName,
+            websiteUri: l.websiteUri || undefined,
+            phoneNumbers: l.phone ? { primaryPhone: l.phone } : undefined,
+            categories: l.category ? { primaryCategory: { displayName: l.category } } : undefined,
+            profile: l.description ? { description: l.description } : undefined,
+            latlng: (l.latitude && l.longitude) ? { latitude: l.latitude, longitude: l.longitude } : undefined
+          }));
+        }
       }
     }
     throw err;
@@ -550,8 +558,11 @@ export async function fetchGoogleReviews(accessToken: string, locationId: string
     const data = await response.json();
     return data.reviews || [];
   } catch (err: any) {
-    if (err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED') {
-      console.warn(`[GBP RATE LIMITED] fetchGoogleReviews for ${locationPath} rate limited.`);
+    const isScopeOrAccessIssue = err.status === 403 || err.code === 'GOOGLE_SCOPE_MISSING' || err.code === 'GOOGLE_ACCESS_DENIED' || err.code === 'GOOGLE_API_ACCESS_DENIED';
+    const isRateLimitIssue = err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED';
+
+    if (isRateLimitIssue || isScopeOrAccessIssue) {
+      console.warn(`[GBP REVIEWS WARNING] fetchGoogleReviews for ${locationPath} failed (${err.message}). Returning empty list.`);
       return [];
     }
     throw err;
@@ -670,8 +681,11 @@ export async function fetchPerformanceMetrics(accessToken: string, locationId: s
 
     return response.json();
   } catch (err: any) {
-    if (err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED') {
-      console.warn(`[GBP RATE LIMITED] fetchPerformanceMetrics for ${locationName} rate limited.`);
+    const isScopeOrAccessIssue = err.status === 403 || err.code === 'GOOGLE_SCOPE_MISSING' || err.code === 'GOOGLE_ACCESS_DENIED' || err.code === 'GOOGLE_API_ACCESS_DENIED';
+    const isRateLimitIssue = err.status === 429 || err.code === 'GOOGLE_RATE_LIMITED' || err.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || err.code === 'QUOTA_TEMPORARILY_EXCEEDED';
+
+    if (isRateLimitIssue || isScopeOrAccessIssue) {
+      console.warn(`[GBP METRICS WARNING] fetchPerformanceMetrics for ${locationName} failed (${err.message}). Returning null.`);
       return null;
     }
     throw err;

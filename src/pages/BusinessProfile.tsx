@@ -96,6 +96,8 @@ export default function BusinessProfile() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [isQuotaNotGranted, setIsQuotaNotGranted] = useState(false);
+  const [accountIdInput, setAccountIdInput] = useState('525028570718943446');
+  const [savingAccountId, setSavingAccountId] = useState(false);
 
   useEffect(() => {
     const connectedParam = searchParams.get('connected');
@@ -149,6 +151,9 @@ export default function BusinessProfile() {
         const accs = await apiFetch('/api/google/accounts');
         if (Array.isArray(accs)) {
           setAccounts(accs);
+          if (accs.length > 0 && accs[0]?.googleAccountId) {
+            setAccountIdInput(accs[0].googleAccountId.replace('accounts/', ''));
+          }
         }
       } catch (err) {
         console.warn('Could not load accounts list:', err);
@@ -191,6 +196,34 @@ export default function BusinessProfile() {
       setLoading(false);
     }
   }
+
+  const handleSaveAccountId = async () => {
+    if (!accountIdInput.trim()) return;
+    setSavingAccountId(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const res = await apiFetch('/api/google/set-account-id', {
+        method: 'POST',
+        body: JSON.stringify({
+          accountId: accountIdInput.trim(),
+          accountName: `Business Account (${accountIdInput.trim()})`
+        })
+      });
+      if (res.success) {
+        setSuccess(`Business Account ID saved successfully as '${res.accountId || accountIdInput.trim()}'!`);
+        if (Array.isArray(res.accounts)) {
+          setAccounts(res.accounts);
+        }
+      } else {
+        setError(res.message || 'Failed to save Business Account ID');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Error saving Business Account ID');
+    } finally {
+      setSavingAccountId(false);
+    }
+  };
 
   const handleRetryStatus = async () => {
     setRetryingStatus(true);
@@ -235,8 +268,8 @@ export default function BusinessProfile() {
       if (e.code === 'GOOGLE_API_QUOTA_PENDING' || e.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || e.status === 429) {
         setIsQuotaNotGranted(true);
         setError('OAuth token is valid, but Google Business Profile API quota is pending approval in Google Cloud Console.');
-      } else if (e.code === 'GOOGLE_SCOPE_MISSING') {
-        setError('Missing required scope (https://www.googleapis.com/auth/business.manage). Please disconnect and reconnect Google with all permissions checked.');
+      } else if (e.code === 'GOOGLE_SCOPE_MISSING' || e.code === 'GOOGLE_API_FORBIDDEN' || e.status === 403) {
+        setError(e.message || 'Missing required scope (https://www.googleapis.com/auth/business.manage) or API permission denied.');
       } else {
         setError(e.message || 'Account Management API verification test failed');
       }
@@ -501,7 +534,7 @@ export default function BusinessProfile() {
   // Primary account resolution from local DB
   const primaryAccount = accounts.length > 0 ? accounts[0] : null;
   const displayAccountName = primaryAccount?.accountName || 'Primary Business Profile';
-  const displayAccountId = primaryAccount?.googleAccountId || 'accounts/1092837465';
+  const displayAccountId = primaryAccount?.googleAccountId || 'accounts/525028570718943446';
   const displayEmail = status?.accountEmail || 'blackstar.p@gmail.com';
   const displayLastSynced = status?.lastSyncedAt || primaryAccount?.lastSyncedAt;
 
@@ -823,6 +856,48 @@ export default function BusinessProfile() {
             <span className="text-sm font-bold text-muted truncate block">
               {displayLastSynced ? formatDate(displayLastSynced) : (isOAuthConnected ? 'Local DB Ready' : 'Never')}
             </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Business Account ID Configuration Card */}
+      <div className="bg-card rounded-[2.5rem] p-7 border border-border shadow-sm space-y-4">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-primary/10 text-primary rounded-2xl border border-primary/20">
+              <Store className="w-6 h-6" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                Google Business Account ID
+                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-primary/10 text-primary border border-primary/20 uppercase tracking-widest">
+                  Active
+                </span>
+              </h3>
+              <p className="text-xs text-muted mt-0.5">
+                Current linked account: <strong className="text-white font-mono">{displayAccountId}</strong>
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 w-full md:w-auto">
+            <div className="relative flex-1 md:w-64">
+              <input
+                type="text"
+                value={accountIdInput}
+                onChange={(e) => setAccountIdInput(e.target.value)}
+                placeholder="525028570718943446"
+                className="w-full bg-background border border-border rounded-xl px-3.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-primary"
+              />
+            </div>
+            <button
+              onClick={handleSaveAccountId}
+              disabled={savingAccountId}
+              className="px-4 py-2 bg-primary hover:bg-primary/90 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center gap-1.5 shrink-0 disabled:opacity-50"
+            >
+              {savingAccountId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              Save Business ID
+            </button>
           </div>
         </div>
       </div>

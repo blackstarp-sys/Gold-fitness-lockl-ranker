@@ -54,10 +54,14 @@ export async function apiFetch<T = any>(
       ) as Error & {
         status?: number;
         code?: string;
+        googleError?: any;
+        details?: any;
       };
 
       error.status = response.status;
-      error.code = data?.code || data?.error_code || (response.status === 401 ? 'UNAUTHORIZED' : undefined);
+      error.code = data?.code || data?.error_code || (response.status === 401 ? 'UNAUTHORIZED' : (response.status === 403 ? 'GOOGLE_API_FORBIDDEN' : undefined));
+      error.googleError = data?.googleError || null;
+      error.details = data?.details || null;
 
       console.error('[API FETCH FAILED]', {
         method,

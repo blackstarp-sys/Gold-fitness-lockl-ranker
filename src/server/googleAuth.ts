@@ -1,6 +1,7 @@
 import { db } from '../db/index.ts';
 import { users } from '../db/schema.ts';
 import { eq } from 'drizzle-orm';
+import { google } from 'googleapis';
 
 export interface GoogleTokenRecord {
   accessToken: string;
@@ -9,21 +10,35 @@ export interface GoogleTokenRecord {
   scope?: string;
 }
 
-const DEFAULT_GOOGLE_CLIENT_ID = '998070896185-9csa32q0nt5pitjaqip21lsum55l7m0n.apps.googleusercontent.com';
+const DEFAULT_GOOGLE_CLIENT_ID = '1011063310836-icen8bjk8ck7n5252cp69h1csvtli30b.apps.googleusercontent.com';
 const DEFAULT_GOOGLE_CLIENT_SECRET = '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';
 
 export function getGoogleClientId(): string {
-  return process.env.GOOGLE_CLIENT_ID?.trim() || DEFAULT_GOOGLE_CLIENT_ID;
+  const envId = process.env.GOOGLE_CLIENT_ID?.trim();
+  if (envId && !envId.includes('817066639821') && !envId.includes('998070896185') && envId !== 'your_google_client_id.apps.googleusercontent.com') {
+    return envId;
+  }
+  return DEFAULT_GOOGLE_CLIENT_ID;
 }
 
 export function getGoogleClientSecret(): string {
-  return process.env.GOOGLE_CLIENT_SECRET?.trim() || DEFAULT_GOOGLE_CLIENT_SECRET;
+  const envSecret = process.env.GOOGLE_CLIENT_SECRET?.trim();
+  if (envSecret && envSecret !== 'your_google_client_secret') {
+    return envSecret;
+  }
+  return DEFAULT_GOOGLE_CLIENT_SECRET;
 }
 
 export function isGoogleOAuthConfigured(): boolean {
   const clientId = getGoogleClientId();
   const clientSecret = getGoogleClientSecret();
   return Boolean(clientId && clientSecret);
+}
+
+export function getOAuth2Client(redirectUri?: string) {
+  const clientId = getGoogleClientId();
+  const clientSecret = getGoogleClientSecret();
+  return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 }
 
 /**
@@ -111,6 +126,9 @@ export async function getValidGoogleAccessToken(userId: number): Promise<string>
   const now = Date.now();
   const expiresAtMs = user.googleTokenExpiresAt ? new Date(user.googleTokenExpiresAt).getTime() : 0;
   const isExpired = expiresAtMs > 0 ? (expiresAtMs <= now + 60000) : false;
+
+  // Log stored connection details before returning token
+  console.log('STORED GOOGLE SCOPES:', user.googleScopes);
 
   // 1. If access token exists and is still valid, return it
   if (user.googleAccessToken && !isExpired) {
