@@ -11,6 +11,11 @@ googleAuthProvider.addScope('openid');
 googleAuthProvider.addScope('email');
 googleAuthProvider.addScope('profile');
 
+if (typeof window !== 'undefined') {
+  (window as any).firebaseApp = app;
+  (window as any).firebaseAuth = auth;
+}
+
 export enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',

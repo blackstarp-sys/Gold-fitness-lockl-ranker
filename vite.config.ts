@@ -1,3 +1,7 @@
+if (typeof globalThis !== 'undefined' && (globalThis as any).__dirname === '.') {
+  (globalThis as any).__dirname = process.cwd();
+}
+
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
@@ -17,10 +21,13 @@ export default defineConfig(({ mode }) => {
         devOptions: {
           enabled: false
         },
+        workbox: {
+          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+        },
         manifest: {
           name: "Goldfitness-localranker",
-          short_name: "RankLocal",
-          description: "Manage your Google My Business profile with AI-powered tools.",
+          short_name: "GoldRanker",
+          description: "Google Business Profile Manager with AI Auto-Reply",
           theme_color: "#2563eb",
           background_color: "#ffffff",
           display: "standalone",
@@ -52,6 +59,11 @@ export default defineConfig(({ mode }) => {
       port: 3000,
       hmr: disableHmr ? false : true,
       watch: disableHmr ? null : {},
+    },
+    build: {
+      outDir: 'dist',
+      emptyOutDir: false,
+      sourcemap: true,
     },
   };
 });

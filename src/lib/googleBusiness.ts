@@ -6,7 +6,7 @@
 
 import { db } from '../db/index.ts';
 import { googleBusinessAccounts, users, businessLocations } from '../db/schema.ts';
-import { eq, and } from 'drizzle-orm';
+import { eq, and, ne } from 'drizzle-orm';
 import { getServiceCooldown, setServiceCooldown, setUserApiAccessState } from './rateLimitCache.ts';
 
 const GBP_ACCOUNT_MANAGEMENT_API = 'https://mybusinessaccountmanagement.googleapis.com/v1';
@@ -325,8 +325,23 @@ export async function getBusinessAccounts(accessToken: string, userId?: number):
 
 /**
  * Retrieves cached Google Business Accounts directly from the local database.
+ * Only returns verified accounts, purging any unverified auto-created fake accounts.
  */
 export async function getCachedBusinessAccounts(userId: number): Promise<BusinessAccount[]> {
+  try {
+    // Delete any previously auto-created database row with google_account_id='accounts/525028570718943446'
+    // unless that account was subsequently verified through Google API synchronization.
+    await db.delete(googleBusinessAccounts).where(
+      and(
+        eq(googleBusinessAccounts.userId, userId),
+        eq(googleBusinessAccounts.googleAccountId, 'accounts/525028570718943446'),
+        ne(googleBusinessAccounts.role, 'verified_google_api')
+      )
+    );
+  } catch (err: any) {
+    // Continue if delete fails or table is updating
+  }
+
   const records = await db.select().from(googleBusinessAccounts).where(eq(googleBusinessAccounts.userId, userId));
   return records.map(r => ({
     name: r.googleAccountId,
@@ -366,29 +381,7 @@ export async function getOrFetchBusinessAccounts(
   const cooldown = isAccountInCooldown(userId, 'mybusinessaccountmanagement.googleapis.com');
   if (cooldown.inCooldown) {
     console.warn(`[GBP COOLDOWN ACTIVE] User ${userId} / Account Management is rate-limited. Serving ${cached.length} cached accounts (${cooldown.remainingSeconds}s remaining).`);
-    if (cached.length > 0) {
-      return { accounts: cached, fromCache: true, rateLimited: true, quotaNotGranted: cooldown.quotaNotGranted };
-    }
-    // Check if user has businessLocations in DB to synthesize fallback account
-    const existingLocs = await db.select().from(businessLocations).where(eq(businessLocations.userId, userId));
-    if (existingLocs.length > 0) {
-      const fallbackAccName = existingLocs[0].googleAccountId || 'accounts/primary';
-      const fallback: BusinessAccount = {
-        name: fallbackAccName,
-        accountName: existingLocs[0].businessName || 'Google Business Account',
-        type: 'PERSONAL',
-        lastSyncedAt: new Date()
-      };
-      return { accounts: [fallback], fromCache: true, rateLimited: true, quotaNotGranted: cooldown.quotaNotGranted };
-    }
-    const err: any = new Error(cooldown.quotaNotGranted 
-      ? 'Google Business Profile API quota is not currently available for this project. Review the API quota/access configuration in Google Cloud Console.'
-      : `Google API rate limit reached. Please wait ${cooldown.remainingSeconds}s and try Sync again.`);
-    err.status = 429;
-    err.code = cooldown.quotaNotGranted ? 'GOOGLE_API_QUOTA_NOT_GRANTED' : 'QUOTA_TEMPORARILY_EXCEEDED';
-    err.retryAfter = cooldown.remainingSeconds;
-    err.blockedLocally = true;
-    throw err;
+    return { accounts: cached, fromCache: true, rateLimited: true, quotaNotGranted: cooldown.quotaNotGranted };
   }
 
   // 3. In-Memory Request Deduplication
@@ -417,6 +410,7 @@ export async function getOrFetchBusinessAccounts(
             googleAccountId: acc.name,
             accountName: acc.accountName,
             accountType: acc.type,
+            role: 'verified_google_api',
             lastSyncedAt: syncDate,
             updatedAt: syncDate,
           });
@@ -424,6 +418,7 @@ export async function getOrFetchBusinessAccounts(
           await db.update(googleBusinessAccounts).set({
             accountName: acc.accountName,
             accountType: acc.type,
+            role: 'verified_google_api',
             lastSyncedAt: syncDate,
             updatedAt: syncDate,
           }).where(eq(googleBusinessAccounts.id, existing[0].id));
@@ -447,18 +442,7 @@ export async function getOrFetchBusinessAccounts(
         if (cached.length > 0) {
           return { accounts: cached, fromCache: true, rateLimited: isRateLimitIssue, scopeMissing: isScopeOrAccessIssue };
         }
-        // Synthesize fallback from businessLocations if present
-        const existingLocs = await db.select().from(businessLocations).where(eq(businessLocations.userId, userId));
-        if (existingLocs.length > 0) {
-          const fallbackAccName = existingLocs[0].googleAccountId || 'accounts/525028570718943446';
-          const fallback: BusinessAccount = {
-            name: fallbackAccName,
-            accountName: existingLocs[0].businessName || 'Google Business Account',
-            type: 'PERSONAL',
-            lastSyncedAt: new Date()
-          };
-          return { accounts: [fallback], fromCache: true, rateLimited: isRateLimitIssue, scopeMissing: isScopeOrAccessIssue };
-        }
+        return { accounts: [], fromCache: true, rateLimited: isRateLimitIssue, scopeMissing: isScopeOrAccessIssue };
       }
       throw err;
     }

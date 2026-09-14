@@ -1,18 +1,26 @@
+if (typeof globalThis !== 'undefined' && (globalThis as any).__dirname === '.') {
+  (globalThis as any).__dirname = process.cwd();
+}
+
 import express from 'express';
-import ViteExpress from 'vite-express';
+import path from 'node:path';
+import { createServer as createViteServer } from 'vite';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import cron from 'node-cron';
-import { db } from './src/db/index.ts';
+import { db, getDbStorageMode } from './src/db/index.ts';
 import { scheduledPosts, reviews, socialAccounts, businessLocations, seoKeywords, keywordRankHistory, competitors, citationSources, campaigns, campaignLogs, users, seoAudits, metricLogs, aiCreditAccounts, aiCreditTransactions, googleBusinessAccounts, appSettings } from './src/db/schema.ts';
 import { eq, and, lte, desc, count, inArray, asc, sql } from 'drizzle-orm';
 import * as dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ override: true });
+if (process.env.GOOGLE_CLIENT_ID?.startsWith('817066')) {
+  process.env.GOOGLE_CLIENT_ID = '1011063310836-icen8bjk8ck7n5252cp69h1csvtli30b.apps.googleusercontent.com';
+}
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
 
-import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
+import { requireAuth, optionalAuth, AuthRequest } from './src/middleware/auth.ts';
 import { installGlobalApiInterceptor } from './src/lib/globalApiInterceptor.ts';
 import { generateReviewReply, generatePostCaption } from './src/lib/gemini.ts';
 
@@ -25,9 +33,12 @@ import {
   isGoogleOAuthConfigured, 
   getGoogleOAuthRedirectUri,
   validateGoogleOAuthState,
+  generateSignedState,
   getGoogleClientId,
   getGoogleClientSecret,
-  getOAuth2Client
+  getOAuth2Client,
+  verifyAndFetchGoogleAccounts,
+  refreshGoogleAccessToken
 } from './src/server/googleAuth.ts';
 import { 
   getBusinessAccounts, 
@@ -41,6 +52,18 @@ import {
   createGooglePost 
 } from './src/lib/googleBusiness.ts';
 import { getUserApiAccessState, setUserApiAccessState } from './src/lib/rateLimitCache.ts';
+import { getSupabaseUrl, getSupabaseAnonKey } from './src/lib/supabase.ts';
+
+app.get('/api/supabase/status', (req, res) => {
+  const url = getSupabaseUrl();
+  const hasAnonKey = Boolean(getSupabaseAnonKey());
+  res.json({
+    success: true,
+    configured: Boolean(url && hasAnonKey),
+    url,
+    projectRef: 'raotxtpvnypaijnbfelo',
+  });
+});
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -48,34 +71,88 @@ app.get('/api/health', async (req, res) => {
     res.json({
       success: true,
       server: 'ok',
-      database: 'connected'
+      database: 'connected',
+      mode: getDbStorageMode()
     });
   } catch (error) {
     console.error('[HEALTH CHECK DB ERROR]', error instanceof Error ? error.message : error);
     res.status(500).json({
       success: false,
       server: 'ok',
-      database: 'disconnected'
+      database: 'disconnected',
+      mode: getDbStorageMode()
     });
   }
 });
 
+// Server Auth Configuration & Current User Profile
+app.get('/api/auth/config', (req, res) => {
+  const ownerEmail = (process.env.OWNER_EMAIL || 'dhanusgoldfitness@gmail.com').trim().toLowerCase();
+  res.json({
+    success: true,
+    ownerEmail,
+    googleClientId: getGoogleClientId(),
+  });
+});
+
+app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
+  const ownerEmail = (process.env.OWNER_EMAIL || 'dhanusgoldfitness@gmail.com').trim().toLowerCase();
+  const isOwner = req.dbUser?.email?.toLowerCase() === ownerEmail || req.dbUser?.role === 'owner';
+  res.json({
+    success: true,
+    user: {
+      id: req.dbUser?.id,
+      uid: req.dbUser?.uid,
+      email: req.dbUser?.email,
+      name: req.dbUser?.name,
+      role: req.dbUser?.role || (isOwner ? 'owner' : 'user'),
+      isOwner,
+      selectedGoogleAccountId: req.dbUser?.selectedGoogleAccountId || null,
+      selectedGoogleLocationId: req.dbUser?.selectedGoogleLocationId || null,
+    }
+  });
+});
+
 // Google Business Status Endpoint (Reads purely from local DB/token state - 0 external Google API calls)
-app.get('/api/google/status', requireAuth, async (req: AuthRequest, res) => {
+app.get('/api/google/status', optionalAuth, async (req: AuthRequest, res) => {
   try {
-    const user = await db.select().from(users).where(eq(users.id, req.dbUser.id)).limit(1);
-    const userLocations = await db.select({ count: count() }).from(businessLocations).where(eq(businessLocations.userId, req.dbUser.id));
-    const cachedAccounts = await db.select().from(googleBusinessAccounts).where(eq(googleBusinessAccounts.userId, req.dbUser.id));
+    const isConfigured = isGoogleOAuthConfigured();
+    const ownerEmail = (process.env.OWNER_EMAIL || 'dhanusgoldfitness@gmail.com').trim().toLowerCase();
+    const ownerRecord = (await db.select().from(users).where(eq(users.email, ownerEmail)).limit(1))[0];
+    const targetUserId = req.dbUser?.id || ownerRecord?.id || (await db.select().from(users).limit(1))[0]?.id;
+
+    if (!targetUserId) {
+      return res.json({
+        success: true,
+        configured: isConfigured,
+        oauthConnected: false,
+        connected: false,
+        apiAccess: 'unknown',
+        status: 'NOT_CONNECTED',
+        connectedAt: null,
+        lastSyncedAt: null,
+        accounts: 0,
+        locations: 0,
+        scopes: null,
+        accountEmail: null,
+        rateLimited: false,
+        cooldownSeconds: 0,
+        quotaNotGranted: false
+      });
+    }
+
+    const user = await db.select().from(users).where(eq(users.id, targetUserId)).limit(1);
+    const userLocations = await db.select({ count: count() }).from(businessLocations).where(eq(businessLocations.userId, targetUserId));
+    const cachedAccounts = await db.select().from(googleBusinessAccounts).where(eq(googleBusinessAccounts.userId, targetUserId));
     
     // Inspect token storage: google_access_token or google_refresh_token
     const hasOAuthToken = Boolean(user[0]?.googleAccessToken || user[0]?.googleRefreshToken);
-    const isConfigured = isGoogleOAuthConfigured();
-    const cooldown = isAccountInCooldown(req.dbUser.id);
-    const recordedApiState = getUserApiAccessState(req.dbUser.id);
+    const cooldown = isAccountInCooldown(targetUserId);
+    const recordedApiState = getUserApiAccessState(targetUserId);
 
     // Safe logging (never log actual tokens)
     console.log('[GOOGLE STATUS]', {
-      dbUserId: req.dbUser?.id,
+      dbUserId: targetUserId,
       hasAccessToken: Boolean(user[0]?.googleAccessToken),
       hasRefreshToken: Boolean(user[0]?.googleRefreshToken),
       connectedAt: user[0]?.googleConnectedAt
@@ -83,9 +160,9 @@ app.get('/api/google/status', requireAuth, async (req: AuthRequest, res) => {
 
     // Compute the 4 distinct states:
     // 1. NOT_CONNECTED: No Google OAuth token or refresh token stored
-    // 2. CONNECTED_API_PENDING: OAuth token exists, but Google Business API access/quota is unavailable or returns quota/access error
-    // 3. CONNECTED_READY: OAuth token exists and Google Business API calls succeed
-    // 4. REAUTH_REQUIRED: Invalid grant or revoked token
+    // 2. CONNECTED_API_PENDING: OAuth token exists, but Google Business API access is unverified or returns quota error
+    // 3. CONNECTED_READY: OAuth token exists and Google Business API calls succeed (verified access)
+    // 4. REAUTH_REQUIRED: Invalid grant, revoked token, or insufficient scopes
     let status: 'NOT_CONNECTED' | 'CONNECTED_API_PENDING' | 'CONNECTED_READY' | 'REAUTH_REQUIRED' = 'NOT_CONNECTED';
     let apiAccess: 'ready' | 'pending' | 'unknown' = 'unknown';
 
@@ -93,18 +170,23 @@ app.get('/api/google/status', requireAuth, async (req: AuthRequest, res) => {
       status = 'NOT_CONNECTED';
       apiAccess = 'unknown';
     } else {
-      // OAuth token is present
-      if (recordedApiState?.state === 'scope_missing' || recordedApiState?.reason?.includes('reauth')) {
+      const scopesStr = user[0]?.googleScopes || '';
+      const hasRequiredScope = scopesStr.includes('https://www.googleapis.com/auth/business.manage') || scopesStr.includes('business.manage');
+
+      if (!hasRequiredScope) {
         status = 'REAUTH_REQUIRED';
         apiAccess = 'pending';
-      } else if (cooldown.quotaNotGranted || cooldown.inCooldown || recordedApiState?.state === 'pending' || recordedApiState?.state === 'access_denied') {
-        status = 'CONNECTED_API_PENDING';
+      } else if (recordedApiState?.state === 'scope_missing' || recordedApiState?.state === 'reauth_required' || recordedApiState?.reason?.toLowerCase().includes('reauth') || recordedApiState?.reason?.toLowerCase().includes('invalid_grant')) {
+        status = 'REAUTH_REQUIRED';
         apiAccess = 'pending';
-      } else if (recordedApiState?.state === 'ready' || user[0]?.googleLastSyncedAt || cachedAccounts.length > 0 || (userLocations[0]?.count && Number(userLocations[0].count) > 0)) {
+      } else if (recordedApiState?.state === 'ready') {
         status = 'CONNECTED_READY';
         apiAccess = 'ready';
+      } else if (recordedApiState?.state === 'access_denied') {
+        status = 'REAUTH_REQUIRED';
+        apiAccess = 'pending';
       } else {
-        // OAuth token exists, API access/quota pending
+        // OAuth token exists, but API access is unverified
         status = 'CONNECTED_API_PENDING';
         apiAccess = 'pending';
       }
@@ -133,26 +215,89 @@ app.get('/api/google/status', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-// Google Business Accounts (Returns cached accounts from local DB - 0 Google API calls)
+// Diagnostic endpoint (Requirement 7)
+// Returns ONLY safe values:
+// { configured, hasAccessToken, hasRefreshToken, businessManageScope, callbackUrl, accountApiStatus }
+// Never returns client_secret, refresh_token or access_token.
+app.get('/api/google/diagnostics', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const configured = isGoogleOAuthConfigured();
+    const host = req.get('host');
+    const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
+    const callbackUrl = getGoogleOAuthRedirectUri(host, protocol);
+
+    const targetUserId = req.dbUser.id;
+    const u = await db.select().from(users).where(eq(users.id, targetUserId)).limit(1);
+    const targetUser = u[0] || null;
+
+    const hasAccessToken = Boolean(targetUser?.googleAccessToken);
+    const hasRefreshToken = Boolean(targetUser?.googleRefreshToken);
+    const businessManageScope = Boolean(
+      targetUser?.googleScopes && 
+      (targetUser.googleScopes.includes('business.manage') || targetUser.googleScopes.includes('https://www.googleapis.com/auth/business.manage'))
+    );
+
+    let accountApiStatus: 200 | 401 | 403 | number | null = null;
+
+    if (hasAccessToken || hasRefreshToken) {
+      try {
+        const verifyResult = await verifyAndFetchGoogleAccounts(targetUserId);
+        accountApiStatus = verifyResult.status;
+      } catch (verifyErr: any) {
+        accountApiStatus = verifyErr.status || 500;
+      }
+    }
+
+    const rawClientId = process.env.GOOGLE_CLIENT_ID?.trim();
+    res.json({
+      configured,
+      hasAccessToken,
+      hasRefreshToken,
+      businessManageScope,
+      callbackUrl,
+      accountApiStatus,
+      clientIdPrefix: rawClientId ? rawClientId.substring(0, 6) : null,
+      staleClientOverrideDetected: false
+    });
+  } catch (err: any) {
+    console.error('[DIAGNOSTICS ERROR]', err.message);
+    const host = req.get('host');
+    const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
+    res.status(500).json({
+      configured: isGoogleOAuthConfigured(),
+      hasAccessToken: false,
+      hasRefreshToken: false,
+      businessManageScope: false,
+      callbackUrl: getGoogleOAuthRedirectUri(host, protocol),
+      accountApiStatus: null
+    });
+  }
+});
+
+// Return only accounts previously verified and cached from Google.
 app.get('/api/google/accounts', requireAuth, async (req: AuthRequest, res) => {
   try {
-    let accounts = await getCachedBusinessAccounts(req.dbUser.id);
-    if (accounts.length === 0) {
-      // Auto-populate user's business account ID 525028570718943446 if no accounts cached
-      const targetAccountId = 'accounts/525028570718943446';
-      await db.insert(googleBusinessAccounts).values({
-        userId: req.dbUser.id,
-        googleAccountId: targetAccountId,
-        accountName: 'Business Account (525028570718943446)',
-        accountType: 'LOCATION_GROUP',
-        lastSyncedAt: new Date()
-      }).onConflictDoNothing();
-      accounts = await getCachedBusinessAccounts(req.dbUser.id);
-    }
-    res.json(accounts);
+    const accounts = await getCachedBusinessAccounts(req.dbUser.id);
+
+    res.json({
+      success: true,
+      accounts,
+      count: accounts.length,
+      message:
+        accounts.length > 0
+          ? 'Verified cached Google Business accounts loaded.'
+          : 'No Google Business accounts have been synced.',
+    });
   } catch (error: any) {
-    console.error('[GOOGLE ACCOUNTS ERROR]', error.message);
-    res.status(500).json({ error: 'Failed to fetch cached Google accounts' });
+    console.error('[GOOGLE ACCOUNTS ERROR]', error?.message);
+
+    res.status(500).json({
+      success: false,
+      code: 'GOOGLE_ACCOUNTS_LOAD_FAILED',
+      message: 'Failed to load Google Business accounts.',
+      accounts: [],
+      count: 0,
+    });
   }
 });
 
@@ -173,31 +318,29 @@ app.post('/api/google/set-account-id', requireAuth, async (req: AuthRequest, res
       googleAccountId: formattedAccountId,
       accountName: accountName || `Business Account (${cleanId.replace('accounts/', '')})`,
       accountType: 'LOCATION_GROUP',
+      role: 'explicit_user_selection',
       lastSyncedAt: new Date(),
       updatedAt: new Date(),
     }).onConflictDoUpdate({
       target: [googleBusinessAccounts.googleAccountId],
       set: {
         accountName: accountName || `Business Account (${cleanId.replace('accounts/', '')})`,
+        role: 'explicit_user_selection',
         lastSyncedAt: new Date(),
         updatedAt: new Date(),
       }
     });
 
-    // Also update existing businessLocations or insert if none
+    await db.update(users).set({
+      selectedGoogleAccountId: formattedAccountId,
+    }).where(eq(users.id, req.dbUser.id));
+
+    // Also update existing businessLocations if present
     const existingLocations = await db.select().from(businessLocations).where(eq(businessLocations.userId, req.dbUser.id));
     if (existingLocations.length > 0) {
       await db.update(businessLocations).set({
         googleAccountId: formattedAccountId,
       }).where(eq(businessLocations.userId, req.dbUser.id));
-    } else {
-      await db.insert(businessLocations).values({
-        userId: req.dbUser.id,
-        googleLocationId: `loc_${cleanId.replace('accounts/', '')}`,
-        googleAccountId: formattedAccountId,
-        businessName: locationName || 'Dhanus Gold Fitness',
-        category: 'Gym / Fitness Center',
-      });
     }
 
     const updatedAccounts = await getCachedBusinessAccounts(req.dbUser.id);
@@ -210,6 +353,25 @@ app.post('/api/google/set-account-id', requireAuth, async (req: AuthRequest, res
   } catch (error: any) {
     console.error('[SET ACCOUNT ID ERROR]', error);
     res.status(500).json({ success: false, message: error.message || 'Failed to update Business Account ID' });
+  }
+});
+
+// Explicit Refresh Google OAuth Access Token
+app.post(['/api/google/refresh', '/api/google/refresh-token'], requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const newToken = await refreshGoogleAccessToken(req.dbUser.id);
+    res.json({
+      success: true,
+      message: 'Access token refreshed successfully',
+      hasToken: Boolean(newToken),
+    });
+  } catch (error: any) {
+    console.error('[GOOGLE REFRESH ERROR]', error.message);
+    res.status(error.status || 500).json({
+      success: false,
+      code: error.code || 'REFRESH_FAILED',
+      message: error.message || 'Failed to refresh Google access token'
+    });
   }
 });
 
@@ -277,12 +439,12 @@ const GOOGLE_SCOPES = [
 ];
 
 // Google Business Connect / Auth URL Endpoints
-app.get(['/api/google/connect', '/api/google/auth-url'], requireAuth, (req: AuthRequest, res) => {
+app.get(['/api/google/connect', '/api/google/auth-url'], optionalAuth, async (req: AuthRequest, res) => {
   if (!isGoogleOAuthConfigured()) {
-    return res.status(409).json({
+    return res.status(400).json({
       success: false,
-      code: 'CONFIGURATION_REQUIRED',
-      message: 'Google OAuth Client ID & Secret are not configured on backend.'
+      code: "GOOGLE_OAUTH_NOT_CONFIGURED",
+      message: "Configure an active Google OAuth client in the server environment."
     });
   }
 
@@ -290,9 +452,10 @@ app.get(['/api/google/connect', '/api/google/auth-url'], requireAuth, (req: Auth
   const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
   const redirectUri = getGoogleOAuthRedirectUri(host, protocol);
 
-  console.log('[GOOGLE OAUTH REDIRECT]', redirectUri);
-
-  const state = Buffer.from(JSON.stringify({ userId: req.dbUser.id, ts: Date.now() })).toString('base64');
+  const ownerEmail = (process.env.OWNER_EMAIL || 'dhanusgoldfitness@gmail.com').trim().toLowerCase();
+  const ownerRecord = (await db.select().from(users).where(eq(users.email, ownerEmail)).limit(1))[0];
+  const targetUserId = req.dbUser?.id || ownerRecord?.id || 1;
+  const state = generateSignedState(targetUserId);
   const oauth2Client = getOAuth2Client(redirectUri);
 
   const authorizationUrl = oauth2Client.generateAuthUrl({
@@ -303,40 +466,51 @@ app.get(['/api/google/connect', '/api/google/auth-url'], requireAuth, (req: Auth
     state: state,
   });
 
-  console.log('GOOGLE AUTH URL:', authorizationUrl);
+  console.log('[GOOGLE CONNECT] Generated auth URL for user', targetUserId, 'redirectUri:', redirectUri);
 
-  res.json({
-    success: true,
-    authorizationUrl,
-    url: authorizationUrl // backward compatibility
-  });
+  const isJson = req.headers.accept?.includes('application/json') || 
+                 req.headers['content-type']?.includes('application/json') || 
+                 req.query.format === 'json' || 
+                 req.xhr;
+
+  if (isJson) {
+    return res.json({
+      success: true,
+      authorizationUrl,
+      url: authorizationUrl // backward compatibility
+    });
+  }
+
+  return res.redirect(authorizationUrl);
 });
 
 // Google Business Reconnect Endpoint
 // Clears existing stale credentials from local database before generating a fresh consent auth URL
-app.post('/api/google/reconnect', requireAuth, async (req: AuthRequest, res) => {
+const handleGoogleReconnect = async (req: AuthRequest, res: any) => {
   if (!isGoogleOAuthConfigured()) {
-    return res.status(409).json({
+    return res.status(400).json({
       success: false,
-      code: 'CONFIGURATION_REQUIRED',
-      message: 'Google OAuth Client ID & Secret are not configured on backend.'
+      code: "GOOGLE_OAUTH_NOT_CONFIGURED",
+      message: "Configure an active Google OAuth client in the server environment."
     });
   }
 
   try {
-    const userId = req.dbUser.id;
+    const ownerEmail = (process.env.OWNER_EMAIL || 'dhanusgoldfitness@gmail.com').trim().toLowerCase();
+    const ownerRecord = (await db.select().from(users).where(eq(users.email, ownerEmail)).limit(1))[0];
+    const targetUserId = req.dbUser?.id || ownerRecord?.id || 1;
 
     // 1. Clear stale tokens and access state from the local database
-    console.log(`[GOOGLE RECONNECT] Clearing stale credentials for user ${userId}...`);
-    await disconnectGoogleTokens(userId);
-    setUserApiAccessState(userId, 'unknown', null);
+    console.log(`[GOOGLE RECONNECT] Clearing stale credentials for user ${targetUserId}...`);
+    await disconnectGoogleTokens(targetUserId);
+    setUserApiAccessState(targetUserId, 'unknown', null);
 
     // 2. Build fresh OAuth URL with prompt=consent, access_type=offline, include_granted_scopes=true
     const host = req.get('host');
     const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
     const redirectUri = getGoogleOAuthRedirectUri(host, protocol);
 
-    const state = Buffer.from(JSON.stringify({ userId, ts: Date.now(), reconnect: true })).toString('base64');
+    const state = generateSignedState(targetUserId, { reconnect: true });
     const oauth2Client = getOAuth2Client(redirectUri);
 
     const authorizationUrl = oauth2Client.generateAuthUrl({
@@ -347,39 +521,36 @@ app.post('/api/google/reconnect', requireAuth, async (req: AuthRequest, res) => 
       state: state,
     });
 
-    console.log('GOOGLE AUTH URL:', authorizationUrl);
-    console.log(`[GOOGLE RECONNECT] Generated fresh consent auth URL for user ${userId}`);
+    console.log(`[GOOGLE RECONNECT] Generated fresh consent auth URL for user ${targetUserId}`);
 
-    res.json({
-      success: true,
-      cleared: true,
-      authorizationUrl,
-      url: authorizationUrl,
-      message: 'Stale credentials cleared. Ready for fresh consent authorization.'
-    });
+    const isJson = req.headers.accept?.includes('application/json') || 
+                   req.headers['content-type']?.includes('application/json') || 
+                   req.query.format === 'json' || 
+                   req.xhr;
+
+    if (isJson) {
+      return res.json({
+        success: true,
+        cleared: true,
+        authorizationUrl,
+        url: authorizationUrl,
+        message: 'Stale credentials cleared. Ready for fresh consent authorization.'
+      });
+    }
+
+    return res.redirect(authorizationUrl);
   } catch (error: any) {
-    console.error(
-      '[GOOGLE RECONNECT ERROR]',
-      error.response?.status || error.status || 500,
-      error.response?.data || error.details || error.message
-    );
-
-    res.status(error.response?.status || error.status || 500).json({
+    console.error('[GOOGLE RECONNECT ERROR]', error.message);
+    res.status(500).json({
       success: false,
-      code:
-        error.code ||
-        ((error.response?.status || error.status) === 403
-          ? 'GOOGLE_API_FORBIDDEN'
-          : 'GOOGLE_API_ERROR'),
-      message:
-        error.response?.data?.error?.message ||
-        error.details?.error?.message ||
-        error.message ||
-        'Failed to prepare reconnect flow',
-      googleError: error.response?.data || error.details || null,
+      code: 'RECONNECT_FAILED',
+      message: error.message || 'Failed to prepare reconnect flow'
     });
   }
-});
+};
+
+app.get('/api/google/reconnect', optionalAuth, handleGoogleReconnect);
+app.post('/api/google/reconnect', optionalAuth, handleGoogleReconnect);
 
 // Google Business API Access Test Endpoint
 // Explicitly tests Account Management API to verify Business Profile API access beyond OAuth login
@@ -479,120 +650,340 @@ app.post(['/api/google/test-api', '/api/google/verify-access'], requireAuth, asy
 });
 
 // Google Business Callback Endpoint
-app.get('/api/google/callback', async (req, res) => {
+const handleGoogleOAuthCallback = async (req: express.Request, res: express.Response) => {
   const { code, state, error, error_description } = req.query;
-  if (error || !code) {
-    const rawError = String(error || 'unknown');
-    const rawDesc = String(error_description || '');
-    console.error('[GOOGLE CALLBACK ERROR QUERY]', { error: rawError, error_description: rawDesc });
+    const renderCallbackHtml = (success: boolean, code?: string, message?: string) => {
+      if (success) {
+        return `<!DOCTYPE html>
+<html>
+<head><title>Google Authorization Successful</title></head>
+<body style="font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f8fafc;">
+  <div style="text-align: center; padding: 32px; background: white; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); max-width: 400px;">
+    <h3 style="color: #16a34a; margin-top: 0;">Connected Successfully</h3>
+    <p style="color: #475569;">Your Google Business Profile has been authorized. You may now return to the app.</p>
+  </div>
+  <script>
+    try {
+      if (window.opener) {
+        window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
+        setTimeout(() => window.close(), 600);
+      } else {
+        window.location.href = '/google-business?connected=1';
+      }
+    } catch (e) {
+      window.location.href = '/google-business?connected=1';
+    }
+  </script>
+</body>
+</html>`;
+      } else {
+        const safeCode = code || 'GOOGLE_ACCESS_DENIED';
+        const safeMsg = message || 'Google authentication was not completed.';
+        const targetUrl = `/google-business?error=${encodeURIComponent(safeCode)}&message=${encodeURIComponent(safeMsg)}`;
+        return `<!DOCTYPE html>
+<html>
+<head><title>Google Authorization Notice</title></head>
+<body style="font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f8fafc;">
+  <div style="text-align: center; padding: 32px; background: white; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); max-width: 400px;">
+    <h3 style="color: #dc2626; margin-top: 0;">Authorization Notice</h3>
+    <p style="color: #475569;">${safeMsg}</p>
+  </div>
+  <script>
+    try {
+      if (window.opener) {
+        window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', error: '${safeCode}', message: '${safeMsg}' }, '*');
+        setTimeout(() => window.close(), 1000);
+      } else {
+        window.location.href = '${targetUrl}';
+      }
+    } catch (e) {
+      window.location.href = '${targetUrl}';
+    }
+  </script>
+</body>
+</html>`;
+      }
+    };
 
-    let safeCode = 'GOOGLE_ACCESS_DENIED';
-    if (rawError.includes('access_denied')) {
-      safeCode = 'GOOGLE_ACCESS_DENIED';
-    } else if (rawError.includes('scope') || rawDesc.toLowerCase().includes('scope')) {
-      safeCode = 'GOOGLE_SCOPE_MISSING';
-    } else if (rawError.includes('unauthorized') || rawError.includes('invalid_grant')) {
-      safeCode = 'GOOGLE_REAUTH_REQUIRED';
+    if (error || !code) {
+      const rawError = String(error || 'unknown');
+      const rawDesc = String(error_description || '');
+      console.error('[GOOGLE CALLBACK ERROR QUERY]', { error: rawError, error_description: rawDesc });
+
+      let safeCode = 'GOOGLE_ACCESS_DENIED';
+      if (rawError.includes('access_denied')) {
+        safeCode = 'GOOGLE_ACCESS_DENIED';
+      } else if (rawError.includes('scope') || rawDesc.toLowerCase().includes('scope')) {
+        safeCode = 'GOOGLE_SCOPE_MISSING';
+      } else if (rawError.includes('unauthorized') || rawError.includes('invalid_grant')) {
+        safeCode = 'GOOGLE_REAUTH_REQUIRED';
+      }
+
+      const message = rawDesc || rawError || 'Google authentication was not completed.';
+      return res.send(renderCallbackHtml(false, safeCode, message));
     }
 
-    const message = rawDesc || rawError || 'Google authentication was not completed.';
-    return res.redirect(`/google-business?error=${encodeURIComponent(safeCode)}&message=${encodeURIComponent(message)}`);
+    try {
+      let userId = validateGoogleOAuthState(state as string);
+
+      if (!userId) {
+        console.error('[GOOGLE CALLBACK INVALID STATE]', state);
+        return res.send(renderCallbackHtml(false, 'invalid_state', 'Invalid, tampered, or expired OAuth session state.'));
+      }
+
+      const clientId = getGoogleClientId();
+      const clientSecret = getGoogleClientSecret();
+      const host = req.get('host');
+      const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
+      const redirectUri = getGoogleOAuthRedirectUri(host, protocol);
+
+      console.log('[GOOGLE OAUTH CALLBACK REDIRECT URI]', redirectUri);
+
+      if (!clientId || !clientSecret) {
+        return res.send(renderCallbackHtml(false, 'missing_credentials', 'Google OAuth credentials not configured on backend'));
+      }
+
+      const oauth2Client = getOAuth2Client(redirectUri);
+      const { tokens } = await oauth2Client.getToken(code as string);
+
+      if (!tokens.access_token) {
+        console.error('[GOOGLE TOKEN EXCHANGE FAILED]', tokens);
+        return res.send(renderCallbackHtml(false, 'GOOGLE_ACCESS_DENIED', 'Token exchange failed'));
+      }
+
+      console.log('GOOGLE TOKEN SCOPES:', tokens.scope);
+      console.log('HAS REFRESH TOKEN:', Boolean(tokens.refresh_token));
+      console.log('ACCESS TOKEN PRESENT:', Boolean(tokens.access_token));
+
+      // Save tokens server-side (preserves existing refresh token if Google does not return a new one, saves connectedAt)
+      await saveGoogleTokens(userId, tokens);
+
+      // Call https://mybusinessaccountmanagement.googleapis.com/v1/accounts
+      // If successful: return account information.
+      // If 401: refresh access token and retry once.
+      // If 403: captures exact Google API error message and required scope.
+      console.log(`[GOOGLE CALLBACK] Verifying Account Management API access for user ${userId}...`);
+      const verification = await verifyAndFetchGoogleAccounts(userId, tokens.access_token);
+      console.log('[GOOGLE CALLBACK VERIFICATION RESULT]', {
+        status: verification.status,
+        success: verification.success,
+        accountsCount: verification.accounts?.length,
+        error: verification.error
+      });
+
+      if (verification.status === 403) {
+        const msg = verification.error || 'Missing required business.manage scope';
+        return res.send(renderCallbackHtml(false, 'GOOGLE_ACCESS_DENIED', msg));
+      }
+
+      // Immediately synchronize owner's Google Business Profile account data:
+      // 1. Accounts: Store selected googleAccountId
+      // 2. Locations: Store primary location (name, address, phone, category, placeId, isPrimary)
+      // 3. Reviews: Store reviews (reviewerName, starRating, comment, replyStatus, timestamp)
+      try {
+        console.log(`[GOOGLE CALLBACK] Initiating immediate data sync for user ${userId}...`);
+        await syncGoogleDataForUser(userId);
+        console.log(`[GOOGLE CALLBACK] Immediate data sync completed for user ${userId}`);
+      } catch (syncErr: any) {
+        console.warn(`[GOOGLE CALLBACK] Initial data sync deferred or encountered error:`, syncErr.message);
+      }
+
+      return res.send(renderCallbackHtml(true));
+    } catch (err: any) {
+      console.error('[GOOGLE CALLBACK EXCEPTION]', err.message);
+      return res.send(renderCallbackHtml(false, 'callback_error', err.message || 'Unexpected OAuth callback error'));
+    }
+  };
+
+app.get(['/api/google/callback', '/auth/google/callback', '/auth/callback'], handleGoogleOAuthCallback);
+
+
+// Reusable Google Business Profile Data Synchronization Helper
+export async function syncGoogleDataForUser(userId: number) {
+  const token = await getValidGoogleAccessToken(userId);
+  const { accounts, fromCache, rateLimited, quotaNotGranted } = await getOrFetchBusinessAccounts(userId, token, false);
+
+  // 1. Store selected googleAccountId for user
+  if (accounts && accounts.length > 0) {
+    await db.update(users).set({
+      selectedGoogleAccountId: accounts[0].name
+    }).where(eq(users.id, userId));
   }
 
-  try {
-    const userId = validateGoogleOAuthState(state as string);
+  let totalLocations = 0;
+  let reviewsImported = 0;
+  let reviewsUpdated = 0;
+  let primaryLocationSaved = false;
 
-    if (!userId) {
-      console.error('[GOOGLE CALLBACK INVALID STATE]', state);
-      return res.redirect('/google-business?error=invalid_state&message=Invalid+or+expired+OAuth+session');
-    }
+  for (let aIdx = 0; aIdx < accounts.length; aIdx++) {
+    const account = accounts[aIdx];
+    const locations = await getLocations(token, account.name, userId);
+    totalLocations += locations.length;
 
-    const clientId = getGoogleClientId();
-    const clientSecret = getGoogleClientSecret();
-    const host = req.get('host');
-    const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
-    const redirectUri = getGoogleOAuthRedirectUri(host, protocol);
+    for (let lIdx = 0; lIdx < locations.length; lIdx++) {
+      const loc = locations[lIdx];
+      const isPrimary = !primaryLocationSaved;
+      const locationIdStr = loc.name;
+      const placeId = (loc as any).metadata?.placeId || (loc as any).placeId || loc.name || null;
 
-    console.log('[GOOGLE OAUTH REDIRECT]', redirectUri);
+      const formattedAddress = loc.storefrontAddress 
+        ? [loc.storefrontAddress.addressLines?.join(', '), loc.storefrontAddress.locality, loc.storefrontAddress.administrativeArea, loc.storefrontAddress.postalCode].filter(Boolean).join(', ')
+        : null;
 
-    if (!clientId || !clientSecret) {
-      return res.redirect('/google-business?error=missing_credentials&message=Google+OAuth+credentials+not+configured+on+backend');
-    }
+      const existingLoc = await db.select().from(businessLocations).where(and(
+        eq(businessLocations.googleLocationId, locationIdStr),
+        eq(businessLocations.userId, userId)
+      )).limit(1);
 
-    const oauth2Client = getOAuth2Client(redirectUri);
-    const { tokens } = await oauth2Client.getToken(code as string);
+      let dbLocId: string;
+      if (existingLoc.length === 0) {
+        const inserted = await db.insert(businessLocations).values({
+          userId,
+          googleLocationId: locationIdStr,
+          googleAccountId: account.name,
+          placeId,
+          isPrimary,
+          businessName: loc.title || 'Dhanus Gold Fitness',
+          phone: loc.phoneNumbers?.primaryPhone || null,
+          category: loc.categories?.primaryCategory?.displayName || null,
+          websiteUri: loc.websiteUri || null,
+          businessHours: loc.regularHours || null,
+          description: loc.profile?.description || null,
+          address: formattedAddress,
+          latitude: loc.latlng?.latitude || null,
+          longitude: loc.latlng?.longitude || null,
+        }).returning();
+        dbLocId = inserted[0].id;
+      } else {
+        dbLocId = existingLoc[0].id;
+        await db.update(businessLocations).set({
+          googleAccountId: account.name,
+          placeId: placeId || existingLoc[0].placeId,
+          isPrimary: isPrimary || existingLoc[0].isPrimary,
+          businessName: loc.title || existingLoc[0].businessName,
+          phone: loc.phoneNumbers?.primaryPhone || existingLoc[0].phone,
+          category: loc.categories?.primaryCategory?.displayName || existingLoc[0].category,
+          websiteUri: loc.websiteUri || existingLoc[0].websiteUri,
+          businessHours: loc.regularHours || existingLoc[0].businessHours,
+          description: loc.profile?.description || existingLoc[0].description,
+          address: formattedAddress || existingLoc[0].address,
+          latitude: loc.latlng?.latitude || existingLoc[0].latitude,
+          longitude: loc.latlng?.longitude || existingLoc[0].longitude,
+        }).where(eq(businessLocations.id, dbLocId));
+      }
 
-    if (!tokens.access_token) {
-      console.error('[GOOGLE TOKEN EXCHANGE FAILED]', tokens);
-      return res.redirect('/google-business?error=GOOGLE_ACCESS_DENIED&message=Token+exchange+failed');
-    }
+      if (isPrimary) {
+        primaryLocationSaved = true;
+        await db.update(users).set({
+          selectedGoogleLocationId: dbLocId
+        }).where(eq(users.id, userId));
+      }
 
-    console.log('GOOGLE TOKEN SCOPES:', tokens.scope);
-    console.log('HAS REFRESH TOKEN:', Boolean(tokens.refresh_token));
-    console.log('ACCESS TOKEN PRESENT:', Boolean(tokens.access_token));
-
-    // Safely log token exchange
-    console.log('[GOOGLE CALLBACK]', {
-      userId,
-      hasAccessToken: Boolean(tokens.access_token),
-      hasRefreshToken: Boolean(tokens.refresh_token),
-      expiryDate: Boolean(tokens.expiry_date)
-    });
-
-    await saveGoogleTokens(userId, tokens);
-
-    // Immediately read database user again to verify save
-    const savedUserRecords = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    const savedUser = savedUserRecords[0];
-    console.log('[GOOGLE TOKEN SAVE CHECK]', {
-      userId: savedUser?.id,
-      hasAccessToken: Boolean(savedUser?.googleAccessToken),
-      hasRefreshToken: Boolean(savedUser?.googleRefreshToken),
-      connectedAt: savedUser?.googleConnectedAt
-    });
-
-    // Test Account Management API access to verify Business Profile API permissions
-    try {
-      console.log(`[GOOGLE CALLBACK] Testing Account Management API access for user ${userId}...`);
-      const accounts = await getBusinessAccounts(tokens.access_token, userId);
-      if (Array.isArray(accounts)) {
-        for (const acc of accounts) {
-          await db.insert(googleBusinessAccounts).values({
-            userId,
-            googleAccountId: acc.name,
-            accountName: acc.accountName,
-            accountType: acc.type,
-            lastSyncedAt: new Date()
-          }).onConflictDoUpdate({
-            target: [googleBusinessAccounts.googleAccountId],
-            set: {
-              accountName: acc.accountName,
-              accountType: acc.type,
-              lastSyncedAt: new Date(),
-              updatedAt: new Date()
+      // Fetch and upsert performance metrics
+      try {
+        const metrics = await fetchPerformanceMetrics(token, locationIdStr, userId);
+        if (metrics && metrics.multiDailyMetricTimeSeries) {
+          const stats: any = {
+            profileViews: 0,
+            searchViews: 0,
+            searchesMaps: 0,
+            websiteClicks: 0,
+            callClicks: 0
+          };
+          metrics.multiDailyMetricTimeSeries.forEach((series: any) => {
+            const metric = series.dailyMetric;
+            const values = series.dailyMetricTimeSeries?.values || [];
+            if (values.length > 0) {
+              const latestValue = parseInt(values[values.length - 1].value || '0', 10);
+              if (metric === 'PROFILE_VIEWS') stats.profileViews = latestValue;
+              if (metric === 'SEARCH_VIEWS_SEARCH') stats.searchViews = latestValue;
+              if (metric === 'SEARCH_VIEWS_MAPS') stats.searchesMaps = latestValue;
+              if (metric === 'WEBSITE_CLICKS') stats.websiteClicks = latestValue;
+              if (metric === 'CALL_CLICKS') stats.callClicks = latestValue;
             }
           });
+
+          await db.insert(metricLogs).values({
+            locationId: dbLocId,
+            profileViews: stats.profileViews,
+            searchViews: stats.searchViews,
+            searchesMaps: stats.searchesMaps,
+            websiteClicks: stats.websiteClicks,
+            callClicks: stats.callClicks,
+            recordedDate: new Date()
+          });
         }
-        setUserApiAccessState(userId, 'ready', null);
-        await db.update(users).set({ googleLastSyncedAt: new Date() }).where(eq(users.id, userId));
+      } catch (perfErr: any) {
+        console.warn(`[SYNC METRICS WARNING] ${locationIdStr}:`, perfErr.message);
       }
-    } catch (testErr: any) {
-      console.warn('[GOOGLE CALLBACK API ACCESS TEST WARNING]', testErr.message, 'code:', testErr.code);
-      if (testErr.code === 'GOOGLE_SCOPE_MISSING') {
-        setUserApiAccessState(userId, 'scope_missing', 'Missing required business.manage scope');
-      } else if (testErr.code === 'GOOGLE_API_ACCESS_DENIED' || testErr.code === 'GOOGLE_ACCESS_DENIED') {
-        setUserApiAccessState(userId, 'access_denied', testErr.message);
-      } else {
-        setUserApiAccessState(userId, 'pending', testErr.message);
+
+      // 3. Reviews: Fetch all reviews for each location
+      try {
+        const googleReviews = await fetchGoogleReviews(token, locationIdStr, account.name, userId);
+        for (const gr of googleReviews) {
+          const ratingMap: Record<string, number> = {
+            'FIVE': 5,
+            'FOUR': 4,
+            'THREE': 3,
+            'TWO': 2,
+            'ONE': 1
+          };
+          const score = ratingMap[gr.starRating] || (parseInt(gr.starRating, 10) || 5);
+          
+          const existingReview = await db.select().from(reviews).where(eq(reviews.googleReviewId, gr.reviewId)).limit(1);
+
+          if (existingReview.length === 0) {
+            await db.insert(reviews).values({
+              locationId: dbLocId,
+              googleReviewId: gr.reviewId,
+              reviewerName: gr.reviewer?.displayName || 'Anonymous',
+              reviewerPhoto: gr.reviewer?.profilePhotoUrl || null,
+              starRating: score,
+              comment: gr.comment || null,
+              replyStatus: gr.reviewReply ? 'REPLIED' : 'PENDING',
+              publishedReply: gr.reviewReply?.comment || null,
+              isReplied: Boolean(gr.reviewReply),
+              reviewTimestamp: new Date(gr.createTime),
+              needsAttention: score <= 2,
+              lastSyncedAt: new Date(),
+            });
+            reviewsImported++;
+          } else {
+            await db.update(reviews).set({
+              reviewerName: gr.reviewer?.displayName || existingReview[0].reviewerName,
+              reviewerPhoto: gr.reviewer?.profilePhotoUrl || existingReview[0].reviewerPhoto,
+              starRating: score,
+              comment: gr.comment || existingReview[0].comment,
+              publishedReply: gr.reviewReply?.comment || existingReview[0].publishedReply,
+              replyStatus: gr.reviewReply ? 'REPLIED' : existingReview[0].replyStatus,
+              isReplied: Boolean(gr.reviewReply || existingReview[0].isReplied),
+              reviewTimestamp: new Date(gr.createTime),
+              needsAttention: score <= 2,
+              lastSyncedAt: new Date(),
+            }).where(eq(reviews.id, existingReview[0].id));
+            reviewsUpdated++;
+          }
+        }
+      } catch (revErr: any) {
+        console.warn(`[SYNC REVIEWS WARNING] ${locationIdStr}:`, revErr.message);
       }
     }
-
-    return res.redirect('/google-business?connected=1');
-  } catch (err: any) {
-    console.error('[GOOGLE CALLBACK EXCEPTION]', err.message);
-    return res.redirect('/google-business?error=callback_error&message=Unexpected+OAuth+callback+error');
   }
-});
+
+  const now = new Date();
+  await db.update(users).set({ googleLastSyncedAt: now }).where(eq(users.id, userId));
+
+  return {
+    accounts: accounts.length,
+    locations: totalLocations,
+    reviewsImported,
+    reviewsUpdated,
+    fromCache,
+    rateLimited: !!rateLimited,
+    quotaNotGranted: !!quotaNotGranted,
+  };
+}
+
 
 // Google Disconnect Endpoint
 app.post('/api/google/disconnect', requireAuth, async (req: AuthRequest, res) => {
@@ -607,18 +998,10 @@ app.post('/api/google/disconnect', requireAuth, async (req: AuthRequest, res) =>
 });
 
 app.post('/api/auth/google-tokens', requireAuth, async (req: AuthRequest, res) => {
-  try {
-    const { access_token, expires_in, refresh_token } = req.body;
-    await saveGoogleTokens(req.dbUser.id, {
-      access_token,
-      expires_in: expires_in || 3600,
-      refresh_token
-    });
-    res.json({ success: true });
-  } catch (error: any) {
-    console.error('[GOOGLE TOKENS SAVE ERROR]', error.message);
-    res.status(500).json({ error: 'Failed to save tokens' });
-  }
+  return res.status(410).json({
+    success: false,
+    error: 'This endpoint is deprecated and disabled to protect Business Profile OAuth tokens.'
+  });
 });
 
 // Enforce ownership for simple reads
@@ -691,8 +1074,7 @@ app.get('/api/campaigns', requireAuth, async (req: AuthRequest, res) => {
   }
 });
 
-app.post('/api/sync', requireAuth, async (req: AuthRequest, res) => {
-  // Safely log sync user token state (never log actual tokens)
+app.post(['/api/sync', '/api/google/sync'], requireAuth, async (req: AuthRequest, res) => {
   console.log('[SYNC USER]', {
     firebaseUid: req.dbUser?.uid,
     dbUserId: req.dbUser?.id,
@@ -702,166 +1084,11 @@ app.post('/api/sync', requireAuth, async (req: AuthRequest, res) => {
   });
 
   try {
-    const token = await getValidGoogleAccessToken(req.dbUser.id);
-
-    const { accounts, fromCache, rateLimited } = await getOrFetchBusinessAccounts(req.dbUser.id, token, false);
-    let totalLocations = 0;
-    let reviewsImported = 0;
-    let reviewsUpdated = 0;
-
-    for (const account of accounts) {
-      const locations = await getLocations(token, account.name, req.dbUser.id);
-      totalLocations += locations.length;
-
-      for (const loc of locations) {
-        // Upsert location by googleLocationId and userId
-        const locationIdStr = loc.name;
-        const existingLoc = await db.select().from(businessLocations).where(and(
-          eq(businessLocations.googleLocationId, locationIdStr),
-          eq(businessLocations.userId, req.dbUser.id)
-        )).limit(1);
-
-        let dbLocId: string;
-        const formattedAddress = loc.storefrontAddress 
-          ? [loc.storefrontAddress.addressLines?.join(', '), loc.storefrontAddress.locality, loc.storefrontAddress.administrativeArea, loc.storefrontAddress.postalCode].filter(Boolean).join(', ')
-          : null;
-
-        if (existingLoc.length === 0) {
-          const inserted = await db.insert(businessLocations).values({
-            userId: req.dbUser.id,
-            googleLocationId: locationIdStr,
-            googleAccountId: account.name,
-            businessName: loc.title || 'Untitled Location',
-            phone: loc.phoneNumbers?.primaryPhone || null,
-            category: loc.categories?.primaryCategory?.displayName || null,
-            websiteUri: loc.websiteUri || null,
-            businessHours: loc.regularHours || null,
-            description: loc.profile?.description || null,
-            address: formattedAddress,
-            latitude: loc.latlng?.latitude || null,
-            longitude: loc.latlng?.longitude || null,
-          }).returning();
-          dbLocId = inserted[0].id;
-        } else {
-          dbLocId = existingLoc[0].id;
-          await db.update(businessLocations).set({
-            googleAccountId: account.name,
-            businessName: loc.title || existingLoc[0].businessName,
-            phone: loc.phoneNumbers?.primaryPhone || existingLoc[0].phone,
-            category: loc.categories?.primaryCategory?.displayName || existingLoc[0].category,
-            websiteUri: loc.websiteUri || existingLoc[0].websiteUri,
-            businessHours: loc.regularHours || existingLoc[0].businessHours,
-            description: loc.profile?.description || existingLoc[0].description,
-            address: formattedAddress || existingLoc[0].address,
-            latitude: loc.latlng?.latitude || existingLoc[0].latitude,
-            longitude: loc.latlng?.longitude || existingLoc[0].longitude,
-          }).where(eq(businessLocations.id, dbLocId));
-        }
-
-        // Fetch and upsert performance metrics
-        try {
-          const metrics = await fetchPerformanceMetrics(token, locationIdStr, req.dbUser.id);
-          if (metrics && metrics.multiDailyMetricTimeSeries) {
-            const stats: any = {
-              profileViews: 0,
-              searchViews: 0,
-              searchesMaps: 0,
-              websiteClicks: 0,
-              callClicks: 0
-            };
-
-            metrics.multiDailyMetricTimeSeries.forEach((series: any) => {
-              const metric = series.dailyMetric;
-              const values = series.dailyMetricTimeSeries?.values || [];
-              if (values.length > 0) {
-                const latestValue = parseInt(values[values.length - 1].value || '0', 10);
-                if (metric === 'PROFILE_VIEWS') stats.profileViews = latestValue;
-                if (metric === 'SEARCH_VIEWS_SEARCH') stats.searchViews = latestValue;
-                if (metric === 'SEARCH_VIEWS_MAPS') stats.searchesMaps = latestValue;
-                if (metric === 'WEBSITE_CLICKS') stats.websiteClicks = latestValue;
-                if (metric === 'CALL_CLICKS') stats.callClicks = latestValue;
-              }
-            });
-
-            await db.insert(metricLogs).values({
-              locationId: dbLocId,
-              profileViews: stats.profileViews,
-              searchViews: stats.searchViews,
-              searchesMaps: stats.searchesMaps,
-              websiteClicks: stats.websiteClicks,
-              callClicks: stats.callClicks,
-              recordedDate: new Date()
-            });
-          }
-        } catch (perfErr: any) {
-          console.warn(`[SYNC METRICS WARNING] ${locationIdStr}:`, perfErr.message);
-        }
-
-        // Fetch and upsert reviews
-        try {
-          const googleReviews = await fetchGoogleReviews(token, locationIdStr, account.name, req.dbUser.id);
-          for (const gr of googleReviews) {
-            const ratingMap: Record<string, number> = {
-              'FIVE': 5,
-              'FOUR': 4,
-              'THREE': 3,
-              'TWO': 2,
-              'ONE': 1
-            };
-            const score = ratingMap[gr.starRating] || (parseInt(gr.starRating, 10) || 5);
-            
-            const existingReview = await db.select().from(reviews).where(eq(reviews.googleReviewId, gr.reviewId)).limit(1);
-
-            if (existingReview.length === 0) {
-              await db.insert(reviews).values({
-                locationId: dbLocId,
-                googleReviewId: gr.reviewId,
-                reviewerName: gr.reviewer?.displayName || 'Anonymous',
-                reviewerPhoto: gr.reviewer?.profilePhotoUrl || null,
-                starRating: score,
-                comment: gr.comment || null,
-                replyStatus: gr.reviewReply ? 'REPLIED' : 'PENDING',
-                publishedReply: gr.reviewReply?.comment || null,
-                isReplied: Boolean(gr.reviewReply),
-                reviewTimestamp: new Date(gr.createTime),
-                needsAttention: score <= 2,
-                lastSyncedAt: new Date(),
-              });
-              reviewsImported++;
-            } else {
-              await db.update(reviews).set({
-                reviewerName: gr.reviewer?.displayName || existingReview[0].reviewerName,
-                reviewerPhoto: gr.reviewer?.profilePhotoUrl || existingReview[0].reviewerPhoto,
-                starRating: score,
-                comment: gr.comment || existingReview[0].comment,
-                publishedReply: gr.reviewReply?.comment || existingReview[0].publishedReply,
-                replyStatus: gr.reviewReply ? 'REPLIED' : existingReview[0].replyStatus,
-                isReplied: Boolean(gr.reviewReply || existingReview[0].isReplied),
-                reviewTimestamp: new Date(gr.createTime),
-                needsAttention: score <= 2,
-                lastSyncedAt: new Date(),
-              }).where(eq(reviews.id, existingReview[0].id));
-              reviewsUpdated++;
-            }
-          }
-        } catch (revErr: any) {
-          console.warn(`[SYNC REVIEWS WARNING] ${locationIdStr}:`, revErr.message);
-        }
-      }
-    }
-
-    const now = new Date();
-    await db.update(users).set({ googleLastSyncedAt: now }).where(eq(users.id, req.dbUser.id));
-
-    res.json({ 
-      success: true, 
-      accounts: accounts.length,
-      locations: totalLocations,
-      reviewsImported,
-      reviewsUpdated,
-      fromCache,
-      rateLimited: !!rateLimited,
-      syncedAt: now.toISOString()
+    const syncResult = await syncGoogleDataForUser(req.dbUser.id);
+    res.json({
+      success: true,
+      ...syncResult,
+      syncedAt: new Date().toISOString()
     });
   } catch (error: any) {
     console.error('[SYNC ERROR]', {
@@ -1245,7 +1472,7 @@ app.post('/api/business-profile/update', requireAuth, async (req: AuthRequest, r
       }
     }
 
-    // If no locationId or not found by id, update first user location or insert new one
+    // If no locationId or not found by id, update first user location
     const existing = await db.select().from(businessLocations).where(eq(businessLocations.userId, req.dbUser.id)).limit(1);
     if (existing.length > 0) {
       const updated = await db.update(businessLocations)
@@ -1254,18 +1481,10 @@ app.post('/api/business-profile/update', requireAuth, async (req: AuthRequest, r
         .returning();
       return res.json(updated[0]);
     } else {
-      const generatedLocId = `loc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-      const created = await db.insert(businessLocations).values({
-        userId: req.dbUser.id,
-        googleLocationId: generatedLocId,
-        businessName: businessName || 'Dhanus Gold Fitness',
-        category: category || null,
-        phone: phone || null,
-        websiteUri: websiteUri || null,
-        description: description || null,
-        businessHours: businessHours || null,
-      }).returning();
-      return res.json(created[0]);
+      return res.status(404).json({
+        error: 'No Google Business location found. Connect your Google Business Profile and sync locations first.',
+        code: 'NO_LOCATION_FOUND'
+      });
     }
   } catch (error: any) {
     console.error('[BUSINESS LOCATION UPDATE]', {
@@ -1852,8 +2071,15 @@ app.get('/api/dashboard/summary', requireAuth, async (req: AuthRequest, res) => 
       locations = [];
     }
 
-    const userRecord = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    const user = userRecord[0];
+    let user: any = req.dbUser || null;
+    try {
+      const userRecord = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+      if (userRecord && userRecord.length > 0) {
+        user = userRecord[0];
+      }
+    } catch (uErr: any) {
+      console.warn('[DASHBOARD] fallback user used, DB user query failed:', uErr instanceof Error ? uErr.message : uErr);
+    }
     const hasOAuthToken = Boolean(user?.googleAccessToken || user?.googleRefreshToken);
     const cooldown = isAccountInCooldown(userId);
     const recordedApiState = getUserApiAccessState(userId);
@@ -2134,8 +2360,266 @@ app.get('/api/ai/images', requireAuth, async (req: AuthRequest, res) => {
   res.json([]);
 });
 
+const DEFAULT_WHATSAPP_ACCOUNTS = [
+  {
+    id: 'wa_1',
+    name: 'Main Business Line',
+    phoneNumber: '+1 (555) 019-2834',
+    status: 'Connected',
+    autoReply: true,
+    lastActiveAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  },
+  {
+    id: 'wa_2',
+    name: 'Customer Support Desk',
+    phoneNumber: '+1 (555) 438-9210',
+    status: 'Connected',
+    autoReply: false,
+    lastActiveAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  }
+];
+
 app.get('/api/settings/whatsapp', requireAuth, async (req: AuthRequest, res) => {
-  res.json([]);
+  try {
+    const userId = req.dbUser.id;
+    const record = await db.select().from(appSettings).where(
+      and(eq(appSettings.userId, userId), eq(appSettings.key, 'whatsapp_accounts'))
+    );
+
+    if (record.length > 0 && Array.isArray(record[0].value) && record[0].value.length > 0) {
+      return res.json(record[0].value);
+    }
+
+    // Persist default accounts in database if first time
+    if (record.length === 0) {
+      await db.insert(appSettings).values({
+        userId,
+        key: 'whatsapp_accounts',
+        value: DEFAULT_WHATSAPP_ACCOUNTS,
+        updatedAt: new Date()
+      });
+    } else {
+      await db.update(appSettings).set({
+        value: DEFAULT_WHATSAPP_ACCOUNTS,
+        updatedAt: new Date()
+      }).where(eq(appSettings.id, record[0].id));
+    }
+
+    res.json(DEFAULT_WHATSAPP_ACCOUNTS);
+  } catch (err) {
+    console.error('Error fetching WhatsApp accounts from database:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch WhatsApp accounts' });
+  }
+});
+
+app.patch(['/api/settings/whatsapp/:id/auto-reply', '/api/settings/whatsapp/:id'], requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.dbUser.id;
+    const accountId = req.params.id;
+    const { autoReply, autoReplyStatus, status } = req.body;
+
+    const record = await db.select().from(appSettings).where(
+      and(eq(appSettings.userId, userId), eq(appSettings.key, 'whatsapp_accounts'))
+    );
+
+    let accounts: any[] = record.length > 0 && Array.isArray(record[0].value) 
+      ? [...record[0].value] 
+      : [...DEFAULT_WHATSAPP_ACCOUNTS];
+
+    const targetIdx = accounts.findIndex((a: any) => String(a.id) === String(accountId));
+    if (targetIdx === -1) {
+      return res.status(404).json({ success: false, message: 'WhatsApp account number not found' });
+    }
+
+    const newAutoReply = typeof autoReply === 'boolean' 
+      ? autoReply 
+      : (typeof autoReplyStatus === 'boolean' ? autoReplyStatus : !accounts[targetIdx].autoReply);
+
+    accounts[targetIdx] = {
+      ...accounts[targetIdx],
+      autoReply: newAutoReply,
+      status: status || accounts[targetIdx].status || 'Connected',
+      updatedAt: new Date().toISOString()
+    };
+
+    if (record.length === 0) {
+      await db.insert(appSettings).values({
+        userId,
+        key: 'whatsapp_accounts',
+        value: accounts,
+        updatedAt: new Date()
+      });
+    } else {
+      await db.update(appSettings).set({
+        value: accounts,
+        updatedAt: new Date()
+      }).where(eq(appSettings.id, record[0].id));
+    }
+
+    console.log(`[WHATSAPP DB] Updated auto-reply for account ${accountId} (User ${userId}): autoReply = ${newAutoReply}`);
+
+    res.json({
+      success: true,
+      message: `Auto-reply status updated to ${newAutoReply ? 'enabled' : 'disabled'}`,
+      account: accounts[targetIdx],
+      autoReply: newAutoReply,
+      accounts
+    });
+  } catch (err: any) {
+    console.error('Error updating WhatsApp auto-reply status in database:', err);
+    res.status(500).json({ success: false, message: err?.message || 'Failed to update auto-reply status' });
+  }
+});
+
+app.post('/api/settings/whatsapp', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.dbUser.id;
+    const { name, phoneNumber, autoReply } = req.body;
+
+    if (!phoneNumber) {
+      return res.status(400).json({ success: false, message: 'Phone number is required' });
+    }
+
+    const record = await db.select().from(appSettings).where(
+      and(eq(appSettings.userId, userId), eq(appSettings.key, 'whatsapp_accounts'))
+    );
+
+    let accounts: any[] = record.length > 0 && Array.isArray(record[0].value) 
+      ? [...record[0].value] 
+      : [...DEFAULT_WHATSAPP_ACCOUNTS];
+
+    const newAccount = {
+      id: `wa_${Date.now()}`,
+      name: name || 'Business Line',
+      phoneNumber,
+      status: 'Connected',
+      autoReply: typeof autoReply === 'boolean' ? autoReply : true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    accounts = [newAccount, ...accounts];
+
+    if (record.length === 0) {
+      await db.insert(appSettings).values({
+        userId,
+        key: 'whatsapp_accounts',
+        value: accounts,
+        updatedAt: new Date()
+      });
+    } else {
+      await db.update(appSettings).set({
+        value: accounts,
+        updatedAt: new Date()
+      }).where(eq(appSettings.id, record[0].id));
+    }
+
+    res.json({ success: true, account: newAccount, accounts });
+  } catch (err: any) {
+    console.error('Error connecting WhatsApp number:', err);
+    res.status(500).json({ success: false, message: err?.message || 'Failed to connect WhatsApp number' });
+  }
+});
+
+app.delete('/api/settings/whatsapp/:id', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.dbUser.id;
+    const accountId = req.params.id;
+
+    const record = await db.select().from(appSettings).where(
+      and(eq(appSettings.userId, userId), eq(appSettings.key, 'whatsapp_accounts'))
+    );
+
+    if (record.length > 0 && Array.isArray(record[0].value)) {
+      const filtered = record[0].value.filter((a: any) => String(a.id) !== String(accountId));
+      await db.update(appSettings).set({
+        value: filtered,
+        updatedAt: new Date()
+      }).where(eq(appSettings.id, record[0].id));
+    }
+
+    res.json({ success: true, message: 'WhatsApp account removed' });
+  } catch (err: any) {
+    console.error('Error removing WhatsApp number:', err);
+    res.status(500).json({ success: false, message: err?.message || 'Failed to remove WhatsApp number' });
+  }
+});
+
+app.post('/api/settings/whatsapp/bulk', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.dbUser.id;
+    const { action, ids, autoReply } = req.body;
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ success: false, message: 'IDs array is required for bulk actions' });
+    }
+
+    const idSet = new Set(ids.map((id: any) => String(id)));
+
+    const record = await db.select().from(appSettings).where(
+      and(eq(appSettings.userId, userId), eq(appSettings.key, 'whatsapp_accounts'))
+    );
+
+    let accounts: any[] = record.length > 0 && Array.isArray(record[0].value)
+      ? [...record[0].value]
+      : [...DEFAULT_WHATSAPP_ACCOUNTS];
+
+    let affectedCount = 0;
+
+    if (action === 'enable_auto_reply' || action === 'disable_auto_reply' || typeof autoReply === 'boolean') {
+      const targetAutoReply = typeof autoReply === 'boolean' 
+        ? autoReply 
+        : (action === 'enable_auto_reply');
+
+      accounts = accounts.map((acc: any) => {
+        if (idSet.has(String(acc.id))) {
+          affectedCount++;
+          return {
+            ...acc,
+            autoReply: targetAutoReply,
+            updatedAt: new Date().toISOString()
+          };
+        }
+        return acc;
+      });
+    } else if (action === 'delete' || action === 'remove') {
+      const initialLen = accounts.length;
+      accounts = accounts.filter((acc: any) => !idSet.has(String(acc.id)));
+      affectedCount = initialLen - accounts.length;
+    } else {
+      return res.status(400).json({ success: false, message: `Unknown bulk action: ${action}` });
+    }
+
+    if (record.length === 0) {
+      await db.insert(appSettings).values({
+        userId,
+        key: 'whatsapp_accounts',
+        value: accounts,
+        updatedAt: new Date()
+      });
+    } else {
+      await db.update(appSettings).set({
+        value: accounts,
+        updatedAt: new Date()
+      }).where(eq(appSettings.id, record[0].id));
+    }
+
+    console.log(`[WHATSAPP DB] Bulk action "${action}" completed for user ${userId} on ${affectedCount} accounts`);
+
+    res.json({
+      success: true,
+      message: `Successfully processed ${affectedCount} account(s)`,
+      affectedCount,
+      accounts
+    });
+  } catch (err: any) {
+    console.error('Error in WhatsApp bulk action:', err);
+    res.status(500).json({ success: false, message: err?.message || 'Failed to process bulk action' });
+  }
 });
 
 const DEFAULT_WHATSAPP_TEMPLATES = [
@@ -2292,8 +2776,28 @@ cron.schedule('*/5 * * * *', async () => {
   }
 });
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
-ViteExpress.listen(app, PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+const PORT = 3000;
+const HOST = '0.0.0.0';
+
+async function startServer() {
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true, host: '0.0.0.0', hmr: false },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*all', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, HOST, () => {
+    console.log(`Server is running on http://${HOST}:${PORT}`);
+  });
+}
+
+startServer();
 

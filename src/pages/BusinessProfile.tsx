@@ -3,7 +3,8 @@ import {
   Store, Loader2, Save, Globe, Phone, Tag, AlertCircle, CheckCircle2, 
   RefreshCw, Link2, Unlink, ExternalLink, ShieldCheck, AlertTriangle, X,
   ShieldAlert, Info, Building2, Clock, MapPin, Sparkles, Database,
-  UserCheck, Calendar, Layers, Check, ArrowUpRight, Copy, QrCode, Printer
+  UserCheck, Calendar, Layers, Check, ArrowUpRight, Copy, QrCode, Printer,
+  Lock
 } from 'lucide-react';
 import { apiFetch } from '../lib/api.ts';
 import { useSearchParams, useNavigate, Link } from 'react-router-dom';
@@ -96,8 +97,29 @@ export default function BusinessProfile() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [isQuotaNotGranted, setIsQuotaNotGranted] = useState(false);
-  const [accountIdInput, setAccountIdInput] = useState('525028570718943446');
+  const [accountIdInput, setAccountIdInput] = useState('');
   const [savingAccountId, setSavingAccountId] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<any | null>(null);
+  const [loadingDiagnostics, setLoadingDiagnostics] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [ownerEmail, setOwnerEmail] = useState<string>('dhanusgoldfitness@gmail.com');
+
+  const loadDiagnostics = async () => {
+    setLoadingDiagnostics(true);
+    setDiagnosticsError(null);
+    try {
+      const res = await apiFetch('/api/google/diagnostics');
+      if (!res || typeof res !== 'object') {
+        throw new Error('Diagnostics endpoint returned an empty or invalid response.');
+      }
+      setDiagnostics(res);
+    } catch (err: any) {
+      console.warn('Could not load Google diagnostics:', err);
+      setDiagnosticsError(err.message || 'Failed to fetch diagnostics');
+    } finally {
+      setLoadingDiagnostics(false);
+    }
+  };
 
   useEffect(() => {
     const connectedParam = searchParams.get('connected');
@@ -109,10 +131,38 @@ export default function BusinessProfile() {
       setShowQrModal(true);
     }
     
+    // Listen for OAuth completion from popup
+    const handlePopupMessage = (event: MessageEvent) => {
+      const origin = event.origin;
+      if (!origin.endsWith('.run.app') && !origin.includes('localhost')) {
+        return;
+      }
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        setSuccess('Google Business Profile OAuth authorized successfully!');
+        setAuthModalUrl(null);
+        setConnecting(false);
+        loadData(true);
+      } else if (event.data?.type === 'OAUTH_AUTH_ERROR') {
+        setAuthModalUrl(null);
+        setConnecting(false);
+        const code = event.data.error;
+        const msg = event.data.message;
+        if (code === 'GOOGLE_ACCESS_DENIED') {
+          setError(`Access Denied (403): If your Google Cloud app is in "Testing" mode, ensure your Google account is added under "Test users" in Google Cloud OAuth consent screen. (${msg || 'Access not granted'})`);
+        } else if (code === 'GOOGLE_SCOPE_MISSING') {
+          setError(`Permission Missing: The required Google Business Profile scope was not granted. Please reconnect and check requested permissions.`);
+        } else {
+          setError(`Google authorization notice: ${msg || code}`);
+        }
+      }
+    };
+    window.addEventListener('message', handlePopupMessage);
+
     if (connectedParam) {
       setSuccess('Google Business Profile OAuth authorized successfully!');
       setSearchParams({});
       loadData(true);
+      loadDiagnostics();
     } else if (errorParam) {
       const decodedError = decodeURIComponent(errorParam);
       const decodedMessage = messageParam ? decodeURIComponent(messageParam) : '';
@@ -130,30 +180,51 @@ export default function BusinessProfile() {
       }
       setSearchParams({});
       loadData(false);
+      loadDiagnostics();
     } else {
       loadData(false);
+      loadDiagnostics();
     }
+
+    return () => {
+      window.removeEventListener('message', handlePopupMessage);
+    };
   }, []);
 
   async function loadData(autoSync = false) {
     setLoading(true);
     setError(null);
     try {
+      try {
+        const authCfg = await apiFetch('/api/auth/config');
+        if (authCfg?.ownerEmail) {
+          setOwnerEmail(authCfg.ownerEmail);
+        }
+      } catch {}
+
       // 1. Fetch Google Status (Reads purely from local DB/cache - 0 external Google API calls)
-      const statusRes: GoogleStatus = await apiFetch('/api/google/status');
-      setStatus(statusRes);
-      if (statusRes.quotaNotGranted) {
-        setIsQuotaNotGranted(true);
+      const statusRes = await apiFetch('/api/google/status');
+
+      if (!statusRes || typeof statusRes !== 'object') {
+        setStatus(null);
+        setIsQuotaNotGranted(false);
+        throw new Error('Google status endpoint returned an empty response.');
       }
+
+      setStatus(statusRes as GoogleStatus);
+      setIsQuotaNotGranted(Boolean(statusRes.quotaNotGranted));
 
       // 2. Fetch Cached Google Business Accounts from Local DB
       try {
-        const accs = await apiFetch('/api/google/accounts');
-        if (Array.isArray(accs)) {
-          setAccounts(accs);
-          if (accs.length > 0 && accs[0]?.googleAccountId) {
-            setAccountIdInput(accs[0].googleAccountId.replace('accounts/', ''));
-          }
+        const response = await apiFetch('/api/google/accounts');
+        const accounts = Array.isArray(response)
+          ? response
+          : Array.isArray(response?.accounts)
+            ? response.accounts
+            : [];
+        setAccounts(accounts);
+        if (accounts.length > 0 && accounts[0]?.googleAccountId) {
+          setAccountIdInput(accounts[0].googleAccountId.replace('accounts/', ''));
         }
       } catch (err) {
         console.warn('Could not load accounts list:', err);
@@ -169,11 +240,11 @@ export default function BusinessProfile() {
         // Default local profile data if no locations exist in DB yet
         const defaultProfile = {
           businessName: 'Dhanus Gold Fitness',
-          category: 'Gym / Fitness Center',
-          address: '123 Wellness Blvd, Fitness District, CA 90210',
-          phone: '+1 (555) 234-5678',
-          websiteUri: 'https://dhanusgoldfitness.com',
-          description: 'Premier fitness center and health club providing strength training, cardio facilities, personal coaching, and local community wellness programs.'
+          category: '',
+          address: 'No locations found',
+          phone: 'Not connected',
+          websiteUri: '',
+          description: ''
         };
         setFormData(prev => ({
           ...prev,
@@ -212,9 +283,15 @@ export default function BusinessProfile() {
       });
       if (res.success) {
         setSuccess(`Business Account ID saved successfully as '${res.accountId || accountIdInput.trim()}'!`);
-        if (Array.isArray(res.accounts)) {
-          setAccounts(res.accounts);
+        const updatedAccounts = Array.isArray(res.accounts)
+          ? res.accounts
+          : Array.isArray(res?.accounts?.accounts)
+            ? res.accounts.accounts
+            : [];
+        if (updatedAccounts.length > 0) {
+          setAccounts(updatedAccounts);
         }
+        await loadData(false);
       } else {
         setError(res.message || 'Failed to save Business Account ID');
       }
@@ -225,17 +302,55 @@ export default function BusinessProfile() {
     }
   };
 
+  const handleSelectAccount = async (account: GoogleAccount) => {
+    setSavingAccountId(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const cleanId = account.googleAccountId.replace('accounts/', '');
+      setAccountIdInput(cleanId);
+      const res = await apiFetch('/api/google/set-account-id', {
+        method: 'POST',
+        body: JSON.stringify({
+          accountId: account.googleAccountId,
+          accountName: account.accountName || 'Dhanus Gold Fitness'
+        })
+      });
+      if (res.success) {
+        setSuccess(`Selected Google Business account: '${account.accountName || cleanId}'`);
+        const updatedAccounts = Array.isArray(res.accounts)
+          ? res.accounts
+          : Array.isArray(res?.accounts?.accounts)
+            ? res.accounts.accounts
+            : [];
+        if (updatedAccounts.length > 0) {
+          setAccounts(updatedAccounts);
+        }
+        await loadData(false);
+      } else {
+        setError(res.message || 'Failed to select account');
+      }
+    } catch (err: any) {
+      setError(err.message || 'Failed to select account');
+    } finally {
+      setSavingAccountId(false);
+    }
+  };
+
   const handleRetryStatus = async () => {
     setRetryingStatus(true);
     setError(null);
     try {
-      const statusRes: GoogleStatus = await apiFetch('/api/google/status');
-      setStatus(statusRes);
-      if (statusRes.quotaNotGranted) {
-        setIsQuotaNotGranted(true);
-      } else {
+      const statusRes = await apiFetch('/api/google/status');
+
+      if (!statusRes || typeof statusRes !== 'object') {
+        setStatus(null);
         setIsQuotaNotGranted(false);
+        throw new Error('Google status endpoint returned an empty response.');
       }
+
+      setStatus(statusRes as GoogleStatus);
+      setIsQuotaNotGranted(Boolean(statusRes.quotaNotGranted));
       setSuccess('Status refreshed successfully.');
     } catch (e: any) {
       setError(e.message || 'Failed to refresh status');
@@ -255,15 +370,23 @@ export default function BusinessProfile() {
       } else {
         setError(res.message || 'Account Management API access is pending approval.');
       }
-      const statusRes: GoogleStatus = await apiFetch('/api/google/status');
-      setStatus(statusRes);
-      if (statusRes.quotaNotGranted) {
-        setIsQuotaNotGranted(true);
-      } else {
+      const statusRes = await apiFetch('/api/google/status');
+
+      if (!statusRes || typeof statusRes !== 'object') {
+        setStatus(null);
         setIsQuotaNotGranted(false);
+        throw new Error('Google status endpoint returned an empty response.');
       }
-      const accs = await apiFetch('/api/google/accounts');
-      if (Array.isArray(accs)) setAccounts(accs);
+
+      setStatus(statusRes as GoogleStatus);
+      setIsQuotaNotGranted(Boolean(statusRes.quotaNotGranted));
+      const response = await apiFetch('/api/google/accounts');
+      const accounts = Array.isArray(response)
+        ? response
+        : Array.isArray(response?.accounts)
+          ? response.accounts
+          : [];
+      setAccounts(accounts);
     } catch (e: any) {
       if (e.code === 'GOOGLE_API_QUOTA_PENDING' || e.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || e.status === 429) {
         setIsQuotaNotGranted(true);
@@ -285,15 +408,15 @@ export default function BusinessProfile() {
       const data = await apiFetch('/api/google/connect');
       if (data?.authorizationUrl) {
         setAuthModalUrl(data.authorizationUrl);
-        // Attempt top navigation first (to break out of iframe), fallback to window.location
-        try {
-          if (window.top && window.top !== window) {
-            window.top.location.href = data.authorizationUrl;
-          } else {
-            window.location.href = data.authorizationUrl;
-          }
-        } catch {
-          window.location.href = data.authorizationUrl;
+        // In AI Studio preview iframe, open provider authorization URL directly in popup
+        const popup = window.open(
+          data.authorizationUrl,
+          'google_oauth_popup',
+          'width=600,height=750,menubar=no,toolbar=no,location=no,status=no'
+        );
+        if (!popup) {
+          // Browser popup blocker triggered - modal with button & copyable link remains open
+          console.warn('[OAUTH POPUP] Popup blocked by browser, modal fallback available');
         }
       } else {
         throw new Error(data?.message || 'Failed to obtain authorization URL');
@@ -312,14 +435,13 @@ export default function BusinessProfile() {
       const data = await apiFetch('/api/google/reconnect', { method: 'POST' });
       if (data?.authorizationUrl) {
         setAuthModalUrl(data.authorizationUrl);
-        try {
-          if (window.top && window.top !== window) {
-            window.top.location.href = data.authorizationUrl;
-          } else {
-            window.location.href = data.authorizationUrl;
-          }
-        } catch {
-          window.location.href = data.authorizationUrl;
+        const popup = window.open(
+          data.authorizationUrl,
+          'google_oauth_popup',
+          'width=600,height=750,menubar=no,toolbar=no,location=no,status=no'
+        );
+        if (!popup) {
+          console.warn('[OAUTH POPUP] Popup blocked by browser, modal fallback available');
         }
       } else {
         throw new Error(data?.message || 'Failed to obtain reconnect authorization URL');
@@ -364,17 +486,23 @@ export default function BusinessProfile() {
     setError(null);
     try {
       const result = await apiFetch('/api/sync', { method: 'POST' });
-      if (result.rateLimited) {
+      if (result?.rateLimited) {
+        setIsQuotaNotGranted(Boolean(result?.quotaNotGranted));
         setSuccess(`Loaded latest cached business profile data. (Google rate limit cooldown active)`);
       } else {
-        setSuccess(`Sync completed! ${result.locations || 0} locations, ${result.reviewsImported || 0} reviews synced.`);
+        setSuccess(`Sync completed! ${result?.locations || 0} locations, ${result?.reviewsImported || 0} reviews synced.`);
       }
       
-      const statusRes: GoogleStatus = await apiFetch('/api/google/status');
-      setStatus(statusRes);
-      if (statusRes.quotaNotGranted) {
-        setIsQuotaNotGranted(true);
+      const statusRes = await apiFetch('/api/google/status');
+
+      if (!statusRes || typeof statusRes !== 'object') {
+        setStatus(null);
+        setIsQuotaNotGranted(false);
+        throw new Error('Google status endpoint returned an empty response.');
       }
+
+      setStatus(statusRes as GoogleStatus);
+      setIsQuotaNotGranted(Boolean(statusRes.quotaNotGranted));
       const locs = await apiFetch('/api/locations');
       if (Array.isArray(locs) && locs.length > 0) {
         setLocations(locs);
@@ -382,8 +510,13 @@ export default function BusinessProfile() {
         setSelectedLocationId(currentSelected.id.toString());
         populateForm(currentSelected);
       }
-      const accs = await apiFetch('/api/google/accounts');
-      if (Array.isArray(accs)) setAccounts(accs);
+      const response = await apiFetch('/api/google/accounts');
+      const accounts = Array.isArray(response)
+        ? response
+        : Array.isArray(response?.accounts)
+          ? response.accounts
+          : [];
+      setAccounts(accounts);
     } catch (e: any) {
       console.error('[SYNC ERROR]', e);
       if (e.code === 'GOOGLE_API_QUOTA_PENDING' || e.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || e.code === 'QUOTA_TEMPORARILY_EXCEEDED' || e.code === 'GOOGLE_RATE_LIMITED' || e.status === 429) {
@@ -407,21 +540,30 @@ export default function BusinessProfile() {
     setError(null);
     try {
       const result = await apiFetch('/api/google/refresh-accounts', { method: 'POST' });
-      if (result.rateLimited) {
-        if (result.quotaNotGranted) {
-          setIsQuotaNotGranted(true);
-        }
+      if (result?.rateLimited) {
+        setIsQuotaNotGranted(Boolean(result?.quotaNotGranted));
         setSuccess('Account discovery rate-limited. Displaying cached Google Business accounts.');
       } else {
-        setSuccess(`Discovered ${result.accounts || 0} Google Business account(s) successfully!`);
+        setSuccess(`Discovered ${result?.accounts || 0} Google Business account(s) successfully!`);
       }
-      const statusRes: GoogleStatus = await apiFetch('/api/google/status');
-      setStatus(statusRes);
-      if (statusRes.quotaNotGranted) {
-        setIsQuotaNotGranted(true);
+      
+      const statusRes = await apiFetch('/api/google/status');
+
+      if (!statusRes || typeof statusRes !== 'object') {
+        setStatus(null);
+        setIsQuotaNotGranted(false);
+        throw new Error('Google status endpoint returned an empty response.');
       }
-      const accs = await apiFetch('/api/google/accounts');
-      if (Array.isArray(accs)) setAccounts(accs);
+
+      setStatus(statusRes as GoogleStatus);
+      setIsQuotaNotGranted(Boolean(statusRes.quotaNotGranted));
+      const response = await apiFetch('/api/google/accounts');
+      const accounts = Array.isArray(response)
+        ? response
+        : Array.isArray(response?.accounts)
+          ? response.accounts
+          : [];
+      setAccounts(accounts);
     } catch (e: any) {
       console.error('[REFRESH ACCOUNT ERROR]', e);
       if (e.code === 'GOOGLE_API_QUOTA_PENDING' || e.code === 'GOOGLE_API_QUOTA_NOT_GRANTED' || e.code === 'QUOTA_TEMPORARILY_EXCEEDED' || e.code === 'GOOGLE_RATE_LIMITED' || e.status === 429) {
@@ -533,9 +675,9 @@ export default function BusinessProfile() {
 
   // Primary account resolution from local DB
   const primaryAccount = accounts.length > 0 ? accounts[0] : null;
-  const displayAccountName = primaryAccount?.accountName || 'Primary Business Profile';
-  const displayAccountId = primaryAccount?.googleAccountId || 'accounts/525028570718943446';
-  const displayEmail = status?.accountEmail || 'blackstar.p@gmail.com';
+  const displayAccountName = primaryAccount?.accountName || (isOAuthConnected ? 'No Google Business accounts synced.' : 'Not connected');
+  const displayAccountId = primaryAccount?.googleAccountId || (isOAuthConnected ? 'No Google Business accounts synced.' : 'Not connected');
+  const displayEmail = status?.accountEmail || 'Not connected';
   const displayLastSynced = status?.lastSyncedAt || primaryAccount?.lastSyncedAt;
 
   // Suppress generic "Connect Google Business Profile first" messages if user is in CONNECTED_API_PENDING
@@ -797,7 +939,7 @@ export default function BusinessProfile() {
                 className="flex items-center gap-2 bg-primary hover:bg-primary/90 text-white px-6 py-2.5 rounded-xl font-bold text-sm transition-all shadow-lg shadow-primary/20 disabled:opacity-50"
               >
                 {connecting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Link2 className="w-4 h-4" />}
-                Connect Google Business Profile
+                {connecting ? 'Connecting...' : `Continue with ${ownerEmail || 'dhanusgoldfitness@gmail.com'}`}
               </button>
             )}
           </div>
@@ -848,20 +990,20 @@ export default function BusinessProfile() {
 
           <div className="p-4 rounded-2xl bg-background/50 border border-border/50">
             <span className="text-[10px] font-bold uppercase tracking-wider text-muted block mb-1">Cached Locations</span>
-            <span className="text-sm font-bold text-white">{locations.length > 0 ? `${locations.length} Location(s)` : '1 Local Profile'}</span>
+            <span className="text-sm font-bold text-white">{locations.length > 0 ? `${locations.length} Location(s)` : 'No locations found'}</span>
           </div>
 
           <div className="p-4 rounded-2xl bg-background/50 border border-border/50">
             <span className="text-[10px] font-bold uppercase tracking-wider text-muted block mb-1">Last Synced</span>
             <span className="text-sm font-bold text-muted truncate block">
-              {displayLastSynced ? formatDate(displayLastSynced) : (isOAuthConnected ? 'Local DB Ready' : 'Never')}
+              {displayLastSynced ? formatDate(displayLastSynced) : 'Not synced'}
             </span>
           </div>
         </div>
       </div>
 
       {/* Business Account ID Configuration Card */}
-      <div className="bg-card rounded-[2.5rem] p-7 border border-border shadow-sm space-y-4">
+      <div className="bg-card rounded-[2.5rem] p-7 border border-border shadow-sm space-y-5">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="p-3 bg-primary/10 text-primary rounded-2xl border border-primary/20">
@@ -871,7 +1013,7 @@ export default function BusinessProfile() {
               <h3 className="text-lg font-bold text-white flex items-center gap-2">
                 Google Business Account ID
                 <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black bg-primary/10 text-primary border border-primary/20 uppercase tracking-widest">
-                  Active
+                  {primaryAccount ? 'Active' : 'Configuration'}
                 </span>
               </h3>
               <p className="text-xs text-muted mt-0.5">
@@ -886,7 +1028,7 @@ export default function BusinessProfile() {
                 type="text"
                 value={accountIdInput}
                 onChange={(e) => setAccountIdInput(e.target.value)}
-                placeholder="525028570718943446"
+                placeholder="e.g. 109876543210"
                 className="w-full bg-background border border-border rounded-xl px-3.5 py-2 text-xs font-mono text-white focus:outline-none focus:border-primary"
               />
             </div>
@@ -898,6 +1040,226 @@ export default function BusinessProfile() {
               {savingAccountId ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
               Save Business ID
             </button>
+          </div>
+        </div>
+
+        {/* Discovered Accounts List & Account Selection */}
+        {accounts.length > 0 ? (
+          <div className="pt-3 border-t border-border/50 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-muted">
+                Synced Google Accounts ({accounts.length}) — Click to Select:
+              </span>
+              <button
+                type="button"
+                onClick={handleRefreshAccount}
+                disabled={refreshingAccount}
+                className="text-[11px] text-primary hover:underline flex items-center gap-1 font-bold"
+              >
+                <RefreshCw className={`w-3 h-3 ${refreshingAccount ? 'animate-spin' : ''}`} />
+                Re-scan Google
+              </button>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {accounts.map((acc) => {
+                const isSelected = displayAccountId === acc.googleAccountId;
+                return (
+                  <button
+                    key={acc.googleAccountId}
+                    type="button"
+                    onClick={() => handleSelectAccount(acc)}
+                    disabled={savingAccountId}
+                    className={`p-3.5 rounded-2xl border text-left flex items-center justify-between transition-all ${
+                      isSelected
+                        ? 'bg-primary/15 border-primary text-white shadow-sm'
+                        : 'bg-background/40 border-border/60 text-muted hover:border-border hover:bg-background/70'
+                    }`}
+                  >
+                    <div>
+                      <p className="text-xs font-bold text-white flex items-center gap-1.5">
+                        <Store className="w-3.5 h-3.5 text-primary" />
+                        {acc.accountName || 'Dhanus Gold Fitness'}
+                      </p>
+                      <p className="text-[10px] font-mono text-muted mt-0.5">{acc.googleAccountId}</p>
+                    </div>
+                    {isSelected ? (
+                      <span className="text-[10px] bg-primary text-white font-black px-2.5 py-0.5 rounded-full uppercase tracking-wider">
+                        Selected
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-muted hover:text-white border border-border/80 px-2 py-0.5 rounded-full">
+                        Select
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ) : (
+          <div className="pt-3 border-t border-border/50">
+            <div className="p-3.5 bg-background/50 border border-border/50 rounded-2xl flex items-center justify-between text-xs text-muted">
+              <span className="flex items-center gap-2 font-medium">
+                <Store className="w-4 h-4 text-muted/60" />
+                No Google Business accounts synced.
+              </span>
+              {isOAuthConnected && (
+                <button
+                  type="button"
+                  onClick={handleRefreshAccount}
+                  disabled={refreshingAccount}
+                  className="text-primary hover:underline font-bold text-xs flex items-center gap-1.5"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${refreshingAccount ? 'animate-spin' : ''}`} />
+                  Sync from Google
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Google OAuth Diagnostics & Connection Monitor */}
+      <div className="bg-card rounded-[2.5rem] p-6 md:p-8 border border-border shadow-sm space-y-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-border/60 pb-5">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-primary/10 text-primary rounded-2xl border border-primary/20">
+              <ShieldCheck className="w-6 h-6" />
+            </div>
+            <div>
+              <h3 className="text-lg font-bold text-white">Google OAuth Diagnostics</h3>
+              <p className="text-xs text-muted mt-0.5">
+                Verify OAuth credentials configuration and live API status securely.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={async () => {
+              await loadDiagnostics();
+              await loadData(false);
+            }}
+            disabled={loadingDiagnostics}
+            className="flex items-center gap-2 bg-gradient-to-r from-primary to-primary/90 hover:from-primary/90 hover:to-primary text-white px-5 py-2.5 rounded-xl font-bold text-xs transition-all shadow-md disabled:opacity-50 shrink-0"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loadingDiagnostics ? 'animate-spin' : ''}`} />
+            Check Connection
+          </button>
+        </div>
+
+        {diagnosticsError && (
+          <div className="bg-danger/10 border border-danger/20 rounded-2xl p-4 flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-danger shrink-0 mt-0.5" />
+            <div>
+              <p className="text-sm font-bold text-white">Diagnostics Connection Error</p>
+              <p className="text-xs text-muted mt-1">{diagnosticsError}</p>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
+          <div className="p-4 rounded-2xl bg-background/50 border border-border/50 space-y-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted block">Client ID Prefix</span>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-white font-mono">
+                {diagnostics?.clientIdPrefix ? `${diagnostics.clientIdPrefix}***` : 'Not Configured'}
+              </span>
+              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
+                diagnostics?.configured ? 'bg-green/10 text-green border border-green/20' : 'bg-danger/10 text-danger border border-danger/20'
+              }`}>
+                {diagnostics?.configured ? 'Valid' : 'Missing'}
+              </span>
+            </div>
+            <p className="text-[10px] text-muted">
+              First characters of your active Google OAuth Client ID environment variable.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-background/50 border border-border/50 space-y-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted block">Client Secret Status</span>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-white flex items-center gap-1">
+                <Lock className="w-3.5 h-3.5 text-muted" /> Securely Hidden
+              </span>
+              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
+                diagnostics?.configured ? 'bg-green/10 text-green border border-green/20' : 'bg-danger/10 text-danger border border-danger/20'
+              }`}>
+                {diagnostics?.configured ? 'Configured' : 'Missing'}
+              </span>
+            </div>
+            <p className="text-[10px] text-muted">
+              Client secret is encrypted and validated internally; never exposed to browser.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-background/50 border border-border/50 space-y-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted block">Scopes & Permissions</span>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-white">
+                business.manage
+              </span>
+              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
+                diagnostics?.businessManageScope ? 'bg-green/10 text-green border border-green/20' : 'bg-amber-500/10 text-amber-300 border border-amber-500/20'
+              }`}>
+                {diagnostics?.businessManageScope ? 'Granted' : 'Pending'}
+              </span>
+            </div>
+            <p className="text-[10px] text-muted">
+              Status of Google Business Profile management permission in active token.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-background/50 border border-border/50 space-y-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted block">Live API Response</span>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-white">
+                {diagnostics?.accountApiStatus === 200 
+                  ? 'HTTP 200 (OK)' 
+                  : diagnostics?.accountApiStatus === 401 
+                  ? 'HTTP 401 (Unauthorized)' 
+                  : diagnostics?.accountApiStatus === 403 
+                  ? 'HTTP 403 (Forbidden)' 
+                  : diagnostics?.accountApiStatus 
+                  ? `HTTP ${diagnostics.accountApiStatus}` 
+                  : 'No Active Connection'}
+              </span>
+              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
+                diagnostics?.accountApiStatus === 200 
+                  ? 'bg-green/10 text-green border border-green/20' 
+                  : 'bg-muted/10 text-muted border border-border'
+              }`}>
+                {diagnostics?.accountApiStatus === 200 ? 'Ready' : 'Pending'}
+              </span>
+            </div>
+            <p className="text-[10px] text-muted">
+              Real-time HTTP validation status returned from Google My Business API gateway.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-background/50 border border-border/50 space-y-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted block">Callback Endpoint</span>
+            <div className="text-sm font-bold text-white truncate font-mono">
+              /api/google/callback
+            </div>
+            <p className="text-[10px] text-muted">
+              Redirect URI registered for OAuth completion handshake callback.
+            </p>
+          </div>
+
+          <div className="p-4 rounded-2xl bg-background/50 border border-border/50 space-y-2">
+            <span className="text-[10px] font-bold uppercase tracking-wider text-muted block">Active Sync Connection</span>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-white">
+                {diagnostics?.hasRefreshToken ? 'Refresh Token Ready' : 'Awaiting Connection'}
+              </span>
+              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${
+                diagnostics?.hasRefreshToken ? 'bg-green/10 text-green border border-green/20' : 'bg-muted/10 text-muted border border-border'
+              }`}>
+                {diagnostics?.hasRefreshToken ? 'Stored' : 'None'}
+              </span>
+            </div>
+            <p className="text-[10px] text-muted">
+              Persistent access keys used to retrieve daily location and customer review updates.
+            </p>
           </div>
         </div>
       </div>
@@ -1050,11 +1412,11 @@ export default function BusinessProfile() {
             <div className="mb-4">
               <span className="text-[10px] font-bold text-muted uppercase tracking-wider block mb-0.5">Last Synced Timestamp</span>
               <h3 className="text-xl font-bold text-white tracking-tight truncate">
-                {displayLastSynced ? formatDate(displayLastSynced) : 'Database Synced & Ready'}
+                {displayLastSynced ? formatDate(displayLastSynced) : 'Not synced'}
               </h3>
               <p className="text-xs text-muted font-medium mt-1 flex items-center gap-1.5">
                 <Calendar className="w-3.5 h-3.5 text-green" />
-                <span>Account Connected: {formatDate(status?.connectedAt || primaryAccount?.createdAt || new Date().toISOString())}</span>
+                <span>Account Connected: {isOAuthConnected ? formatDate(status?.connectedAt || primaryAccount?.createdAt || new Date().toISOString()) : 'Not connected'}</span>
               </p>
             </div>
 
@@ -1203,7 +1565,7 @@ export default function BusinessProfile() {
             className="flex items-center gap-3 bg-primary hover:bg-primary/90 text-white px-8 py-3.5 rounded-2xl font-bold text-sm transition-all shadow-xl shadow-primary/20 disabled:opacity-50"
           >
             {connecting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Link2 className="w-5 h-5" />}
-            Connect Google Business Profile
+            {connecting ? 'Connecting...' : `Continue with ${ownerEmail || 'dhanusgoldfitness@gmail.com'}`}
           </button>
         </div>
       )}
@@ -1500,13 +1862,13 @@ export default function BusinessProfile() {
             <div className="flex flex-col gap-3 pt-2">
               <a
                 href={authModalUrl}
-                target="_top"
+                target="_blank"
                 rel="noopener noreferrer"
                 onClick={() => setConnecting(false)}
-                className="flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-primary hover:bg-primary/90 text-white font-bold text-sm transition-all shadow-lg shadow-primary/20"
+                className="flex items-center justify-center gap-2 px-6 py-3.5 rounded-xl bg-primary hover:bg-primary/90 text-white font-bold text-sm transition-all shadow-lg shadow-primary/20"
               >
                 <ExternalLink className="w-4 h-4" />
-                Authorize with Google
+                Continue with {ownerEmail || 'dhanusgoldfitness@gmail.com'}
               </a>
               <button
                 type="button"

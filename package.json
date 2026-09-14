@@ -5,14 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs && cp -r dist build",
+    "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",
-    "start": "tsx server.ts",
-    "db:push": "drizzle-kit push --force --config=src/db/drizzle.config.ts"
+    "preview": "vite preview",
+    "db:push": "drizzle-kit push --force --config=src/db/drizzle.config.ts",
+    "db:migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@google/genai": "^2.4.0",
     "@google/generative-ai": "^0.24.1",
     "@supabase/ssr": "^0.12.4",

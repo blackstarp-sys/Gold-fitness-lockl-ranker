@@ -1,45 +1,127 @@
 import React from 'react';
 import { useNavigate, Navigate } from 'react-router-dom';
-import { signInWithPopup, GoogleAuthProvider } from 'firebase/auth';
-import { auth, googleAuthProvider } from '../lib/firebase.ts';
+import {
+  GoogleAuthProvider,
+  signInWithCredential
+} from 'firebase/auth';
+import { auth } from '../lib/firebase.ts';
+import firebaseConfig from '../../firebase-applet-config.json';
 import { useAuth } from '../context/AuthContext.tsx';
-import { ShieldCheck, Loader2 } from 'lucide-react';
-import { apiFetch } from '../lib/api.ts';
+import { ShieldCheck, Loader2, AlertCircle } from 'lucide-react';
+
+declare global {
+  interface Window {
+    google?: {
+      accounts?: {
+        id?: {
+          initialize: (options: any) => void;
+          renderButton: (
+            element: HTMLElement,
+            options: any
+          ) => void;
+          cancel: () => void;
+        };
+      };
+    };
+  }
+}
 
 export default function Login() {
   const navigate = useNavigate();
   const { user, loading } = useAuth();
   const [isAuthenticating, setIsAuthenticating] = React.useState(false);
+  const [loginError, setLoginError] = React.useState<string | null>(null);
+  const googleButtonRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    const clientId = (firebaseConfig as any).oAuthClientId;
+
+    if (!clientId) {
+      setLoginError('Google OAuth client ID is not configured.');
+      return;
+    }
+
+    let isMounted = true;
+
+    const renderGoogleButton = () => {
+      if (!isMounted) return;
+      if (!window.google?.accounts?.id || !googleButtonRef.current) {
+        window.setTimeout(renderGoogleButton, 200);
+        return;
+      }
+
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        auto_select: false,
+        cancel_on_tap_outside: true,
+        callback: async (response: { credential?: string }) => {
+          try {
+            setIsAuthenticating(true);
+            setLoginError(null);
+
+            if (!response?.credential) {
+              throw new Error('Google did not return an ID token.');
+            }
+
+            const firebaseCredential =
+              GoogleAuthProvider.credential(response.credential);
+
+            const result = await signInWithCredential(
+              auth,
+              firebaseCredential
+            );
+
+            const authenticatedEmail =
+              result.user.email?.trim().toLowerCase();
+
+            if (authenticatedEmail !== 'dhanusgoldfitness@gmail.com') {
+              await auth.signOut();
+              throw new Error(
+                'Please sign in using dhanusgoldfitness@gmail.com'
+              );
+            }
+
+            navigate('/dashboard', { replace: true });
+          } catch (error: any) {
+            setLoginError(
+              error?.message || 'Google authentication failed.'
+            );
+          } finally {
+            if (isMounted) {
+              setIsAuthenticating(false);
+            }
+          }
+        }
+      });
+
+      if (googleButtonRef.current) {
+        googleButtonRef.current.innerHTML = '';
+
+        window.google.accounts.id.renderButton(
+          googleButtonRef.current,
+          {
+            type: 'standard',
+            theme: 'filled_blue',
+            size: 'large',
+            text: 'continue_with',
+            shape: 'rectangular',
+            width: 320
+          }
+        );
+      }
+    };
+
+    renderGoogleButton();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [navigate]);
 
   if (loading) return null;
   if (user) {
     return <Navigate to="/dashboard" replace />;
   }
-
-  const handleLogin = async () => {
-    setIsAuthenticating(true);
-    try {
-      const result = await signInWithPopup(auth, googleAuthProvider);
-      const credential = GoogleAuthProvider.credentialFromResult(result);
-      if (credential && credential.accessToken) {
-        // Send tokens to backend to save for server-side tasks
-        await apiFetch('/api/auth/google-tokens', {
-          method: 'POST',
-          body: JSON.stringify({
-            access_token: credential.accessToken,
-            // Google auth provider on client doesn't return refresh token by default unless setup properly,
-            // but we can send what we have.
-            expires_in: 3600 
-          })
-        }).catch(console.error);
-      }
-
-      navigate('/dashboard', { replace: true });
-    } catch (err) {
-      console.error('Failed to log in', err);
-      setIsAuthenticating(false);
-    }
-  };
 
   return (
     <div className="flex h-screen items-center justify-center bg-background">
@@ -50,20 +132,24 @@ export default function Login() {
           <ShieldCheck className="w-8 h-8" />
         </div>
         <h1 className="text-2xl font-black text-white mb-2 tracking-tight">Dhanus Gold Fitness</h1>
-        <p className="text-sm text-muted mb-8 font-medium">Sign in to access your Local Ranker AI dashboard.</p>
+        <p className="text-sm text-muted mb-6 font-medium">Sign in to access your Local Ranker AI dashboard.</p>
         
-        <button 
-          onClick={handleLogin}
-          disabled={isAuthenticating}
-          className="w-full flex items-center justify-center gap-3 bg-primary hover:bg-primary/90 text-white disabled:opacity-50 disabled:cursor-not-allowed px-4 py-3 rounded-xl font-bold transition-all shadow-lg shadow-primary/20"
-        >
-          {isAuthenticating ? (
-            <Loader2 className="w-5 h-5 animate-spin text-white" />
-          ) : (
-            <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5 brightness-0 invert" />
+        {loginError && (
+          <div className="mb-6 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-xs text-left flex items-start gap-2 animate-fadeIn">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <div className="flex-1 leading-relaxed">{loginError}</div>
+          </div>
+        )}
+
+        <div className="flex flex-col items-center justify-center min-h-[44px]">
+          {isAuthenticating && (
+            <div className="flex items-center gap-2 mb-3 text-xs font-bold text-primary">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Authenticating session with Firebase...
+            </div>
           )}
-          {isAuthenticating ? 'Authenticating...' : 'Continue with Google'}
-        </button>
+          <div ref={googleButtonRef} className={isAuthenticating ? 'opacity-50 pointer-events-none' : ''} />
+        </div>
       </div>
     </div>
   );

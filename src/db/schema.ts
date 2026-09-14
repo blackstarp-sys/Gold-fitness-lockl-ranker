@@ -7,6 +7,9 @@ export const users = pgTable('users', {
   email: text('email').notNull(),
   name: text('name'),
   avatarUrl: text('avatar_url'),
+  role: text('role').default('user'),
+  selectedGoogleAccountId: text('selected_google_account_id'),
+  selectedGoogleLocationId: text('selected_google_location_id'),
   accessToken: text('access_token'),
   refreshToken: text('refresh_token'),
   googleAccessToken: text('google_access_token'),
@@ -54,6 +57,8 @@ export const businessLocations = pgTable('business_locations', {
   description: text('description'),
   latitude: doublePrecision('latitude'),
   longitude: doublePrecision('longitude'),
+  placeId: text('place_id'),
+  isPrimary: boolean('is_primary').default(false),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
 

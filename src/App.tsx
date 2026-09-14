@@ -54,6 +54,8 @@ function AppContent() {
                 <Route path="manage-plan" element={<ManagePlan />} />
                 
                 <Route path="google-business" element={<BusinessProfile />} />
+                <Route path="locations" element={<BusinessProfile />} />
+                <Route path="business-profile" element={<BusinessProfile />} />
                 <Route path="one-click-optimization" element={<ReviewAutomation />} />
                 <Route path="google-audit" element={<WebsiteAudit />} />
                 <Route path="google-posts" element={<Posts />} />

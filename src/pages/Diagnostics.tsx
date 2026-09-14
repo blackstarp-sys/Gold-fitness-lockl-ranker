@@ -42,7 +42,9 @@ export default function Diagnostics() {
           resData = await raw.json();
           item.statusCode = raw.status;
         } else {
-          resData = await apiFetch(item.endpoint);
+          resData = await apiFetch(item.endpoint, {
+            optionalAuth: item.endpoint === '/api/google/status'
+          });
           item.statusCode = 200;
         }
         const duration = Math.round(performance.now() - start);

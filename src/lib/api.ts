@@ -5,14 +5,16 @@ export interface ApiFetchOptions extends RequestInit {
   showSuccessToast?: boolean;
   successMessage?: string;
   suppressErrorToast?: boolean;
+  optionalAuth?: boolean;
 }
 
-async function getToken() {
+async function getToken(required = true) {
   if (auth.authStateReady) {
     await auth.authStateReady();
   }
   const user = auth.currentUser;
   if (!user) {
+    if (!required) return null;
     const error: any = new Error('Authentication required');
     error.status = 401;
     error.code = 'UNAUTHORIZED';
@@ -30,13 +32,15 @@ export async function apiFetch<T = any>(
   let status: number | undefined;
 
   try {
-    const token = await getToken();
+    const token = await getToken(!options.optionalAuth);
     
     const headers = new Headers(options.headers || {});
     if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
       headers.set('Content-Type', 'application/json');
     }
-    headers.set('Authorization', `Bearer ${token}`);
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
 
     const response = await fetch(path, {
       ...options,
